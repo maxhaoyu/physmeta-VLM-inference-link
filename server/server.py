@@ -422,6 +422,11 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---------------- 取回结果（前端/上传服务轮询用） ----------------
     def _handle_result_get(self, job_id: str):
+        # 该接口会经 Caddy 暴露公网，必须校验上传令牌（与 _handle_upload 一致），
+        # 否则任何人可凭 job_id 读取识别结果，破坏「图纸不出内网」红线。
+        if UPLOAD_TOKEN and not token_ok(self._bearer(), UPLOAD_TOKEN):
+            self._json(401, {"error": "上传认证失败"})
+            return
         row = job_row(job_id)
         if row is None:
             self._json(404, {"error": "任务不存在"})
