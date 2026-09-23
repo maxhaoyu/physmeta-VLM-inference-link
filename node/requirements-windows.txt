@@ -1,0 +1,20 @@
+# Windows 推理节点依赖（CUDA 版，整链路：YOLO + OCR + VLM）
+# 安装（Windows，建议用 Python 3.10/3.11）：
+#   pip install -r requirements-windows.txt
+
+# ---- 主线（YOLO 检测 + OCR 识值 + 后处理）----
+numpy
+Pillow
+rapidocr_onnxruntime
+ultralytics
+openpyxl
+
+# ---- VLM 兜底（Windows CUDA 版，替换 mlx-vlm）----
+# torch 需装 CUDA 版，按显卡驱动选择 index-url，例如 CUDA 12.1：
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+torch
+torchvision
+transformers>=5.7.0
+accelerate
+peft
+av

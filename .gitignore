@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 运行产物
+*.db
+storage/
+inference-jobs/
+node/inference-node.json
+
+# 环境
+.env
+.DS_Store
+*.log

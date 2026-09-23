@@ -1,0 +1,2 @@
+# 服务器端无第三方依赖，仅用 Python 标准库（http.server + sqlite3）。
+# 无需 pip install 任何东西，直接用 Python 3.10+ 运行即可。
