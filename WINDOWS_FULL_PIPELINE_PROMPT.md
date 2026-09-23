@@ -37,7 +37,7 @@ python scripts\eval_swift_lora_windows.py --adapter output\swift-train3\vx-xxx\c
 
 你的两个代码源：
 - 识值主代码仓库：`git@github.com:maxhaoyu/bubble-ocr-mvp.git`（或 HTTPS `https://github.com/maxhaoyu/bubble-ocr-mvp.git`）
-- 推理节点仓库（新增）：`git@github.com:maxhaoyu/physmeta-inference-link.git`
+- 推理节点仓库（新增）：`git@github.com:maxhaoyu/physmeta-VLM-inference-link.git`
 
 在项目目录执行（二选一，已 clone 过就 pull）：
 ```
@@ -46,7 +46,7 @@ git pull origin main
 或首次：
 ```
 git clone git@github.com:maxhaoyu/bubble-ocr-mvp.git
-git clone git@github.com:maxhaoyu/physmeta-inference-link.git
+git clone git@github.com:maxhaoyu/physmeta-VLM-inference-link.git
 ```
 
 > ⚠️ 若 SSH 报权限错，改 HTTPS：`git remote set-url origin https://github.com/maxhaoyu/<repo>.git`；
@@ -57,10 +57,10 @@ git clone git@github.com:maxhaoyu/physmeta-inference-link.git
 
 #### 第 3 步：搭推理节点（Windows 本地）
 
-按 `physmeta-inference-link/docs/节点安装说明.md` 操作，核心是：
+按 `physmeta-VLM-inference-link/docs/节点安装说明.md` 操作，核心是：
 
 1. 目录准备 `C:\PhysMetaInference\`，放入：
-   - `agent.py`、`vlm_fallback_windows.py`、`requirements-windows.txt`（来自 `physmeta-inference-link/node/`）
+   - `agent.py`、`vlm_fallback_windows.py`、`requirements-windows.txt`（来自 `physmeta-VLM-inference-link/node/`）
    - `bubble-ocr-app\`（整个识值代码，含 `models\yolo\cv88-baseline-epoch11.pt`、`models\vlm\` 的 MiniCPM-V-4.6、`models\adapters\` 的第 1 步 LoRA）
 2. 装依赖：
    ```powershell
@@ -77,8 +77,8 @@ git clone git@github.com:maxhaoyu/physmeta-inference-link.git
 这一步分「代码」和「部署」两半：
 
 - **代码（Mac 端已完成方案，你可能要协助落地）**：
-  - 推理队列服务 `physmeta-inference-link/server/server.py` 要部署上线（标准库，Dockerfile 已备好）。
-  - bubble-ocr 的 `/upload` 要加「转发给队列」那一步（见 `physmeta-inference-link/docs/上传入口改造方案.md` 做法 A）。
+  - 推理队列服务 `physmeta-VLM-inference-link/server/server.py` 要部署上线（标准库，Dockerfile 已备好）。
+  - bubble-ocr 的 `/upload` 要加「转发给队列」那一步（见 `physmeta-VLM-inference-link/docs/上传入口改造方案.md` 做法 A）。
   - 前端改成轮询 `job_id`。
 - **部署**：把 `inference-queue` 挂进 compose，配 `INFERENCE_NODE_TOKEN`（这个 token 会下发给 Windows 节点填进 `inference-node.json`）。
 
