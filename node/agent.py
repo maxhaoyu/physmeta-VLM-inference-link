@@ -239,24 +239,77 @@ def upload_result(config: dict[str, Any], job_id: str, run_token: str, archive_p
 # ---------- 推理：调 bubble-ocr 完整链路 ----------
 
 def run_inference(config: dict[str, Any], source: Path, options: dict[str, Any]) -> dict[str, Any]:
-    """调 bubble-ocr 的 pipeline.run：YOLO 检测 → OCR 识值 → 规范化 → VLM 兜底 → 仲裁。"""
+    """调 bubble-ocr 的 pipeline 跑推理。
+
+    支持三种任务类型（options.task_type）：
+      - full          整图识别 pipeline.run（YOLO 检测全图 → 逐框读值）
+      - region_single 单标注框选 pipeline.run_region（读框选区域，1 条）
+      - region_detect 区域批量识别 pipeline.run_region_detect（区域内 YOLO 检测 → 逐框读值）
+    region 模式额外读 options.region = [x, y, width, height]。
+    """
     sys.path.insert(0, str(config["bubble_src"]))
 
     from bubble_ocr import config as bubble_config  # noqa
     from bubble_ocr.pipeline import run as pipeline_run  # noqa
+    from bubble_ocr.pipeline import run_region, run_region_detect, _stats  # noqa
 
-    # 权重 / 模型路径：options 优先，其次环境变量，最后 bubble-ocr 默认
-    weights = Path(str(options.get("weights") or os.getenv("BUBBLE_YOLO_WEIGHTS") or bubble_config.YOLO_WEIGHTS))
-    model_dir = options.get("vlm_model") or os.getenv("BUBBLE_VLM_MODEL") or bubble_config.VLM_MODEL_DIR
-    adapter_dir = options.get("vlm_adapter") or os.getenv("BUBBLE_VLM_ADAPTER") or bubble_config.VLM_ADAPTER_DIR
+    # 权重 / 模型路径：options(任务级) 优先，其次节点配置(inference-node.json)，再环境变量，最后 bubble-ocr 默认
+    weights = Path(str(options.get("weights") or config.get("weights") or os.getenv("BUBBLE_YOLO_WEIGHTS") or bubble_config.YOLO_WEIGHTS))
+    model_dir = options.get("vlm_model") or config.get("vlm_model") or os.getenv("BUBBLE_VLM_MODEL") or bubble_config.VLM_MODEL_DIR
+    adapter_dir = options.get("vlm_adapter") or config.get("vlm_adapter") or os.getenv("BUBBLE_VLM_ADAPTER") or bubble_config.VLM_ADAPTER_DIR
     conf = float(options.get("conf") or bubble_config.YOLO_CONF)
     low_conf = float(options.get("low_conf_threshold") or bubble_config.LOW_CONF_THRESHOLD)
     enable_vlm = bool(options.get("enable_vlm", bubble_config.ENABLE_VLM))
+    use_ocr = bool(options.get("use_ocr", config.get("use_ocr", getattr(bubble_config, "USE_OCR", True))))
 
     model_path = Path(str(model_dir)) if model_dir else None
     adapter_path = Path(str(adapter_dir)) if adapter_dir else None
     if model_path is not None and not model_path.exists():
         model_path = None  # VLM 模型缺失则自动降级为纯 OCR 主线
+
+    enable = enable_vlm and model_path is not None
+
+    def _box_to_dict(r) -> dict[str, Any]:
+        return {
+            "box": r.box,
+            "ocr_text": r.ocr_text,
+            "ocr_conf": r.ocr_conf,
+            "vlm_candidate": r.vlm_candidate,
+            "final_text": r.final_text,
+            "normalized": r.normalized,
+            "source": r.source,
+            "needs_review": r.needs_review,
+            "matched": r.matched,
+            "gold_text": r.gold_text,
+            "symbols": r.symbols,
+            "tools": r.tools,
+            "index": r.index,
+        }
+
+    task_type = str(options.get("task_type") or "full")
+
+    if task_type in ("region_single", "region_detect"):
+        region = options.get("region")
+        if not region or len(region) != 4:
+            raise AgentError(f"{task_type} 任务缺少 region=[x,y,width,height]")
+        region = tuple(float(v) for v in region)
+        if task_type == "region_single":
+            results = run_region(
+                source, region,
+                model_path=model_path, adapter_path=adapter_path,
+                low_conf_threshold=low_conf, enable_vlm=enable, use_ocr=use_ocr,
+            )
+        else:
+            results = run_region_detect(
+                source, weights, region,
+                model_path=model_path, adapter_path=adapter_path,
+                conf=conf, low_conf_threshold=low_conf, enable_vlm=enable, use_ocr=use_ocr,
+            )
+        return {
+            "image": str(source),
+            "stats": _stats(results, False),
+            "boxes": [_box_to_dict(r) for r in results],
+        }
 
     result = pipeline_run(
         source,
@@ -265,31 +318,15 @@ def run_inference(config: dict[str, Any], source: Path, options: dict[str, Any])
         adapter_path=adapter_path,
         conf=conf,
         low_conf_threshold=low_conf,
-        enable_vlm=enable_vlm and model_path is not None,
+        enable_vlm=enable,
+        use_ocr=use_ocr,
     )
 
     # 转成与 server.py / cli.py 一致的 payload 结构
     return {
         "image": result.image_path,
         "stats": result.stats,
-        "boxes": [
-            {
-                "box": r.box,
-                "ocr_text": r.ocr_text,
-                "ocr_conf": r.ocr_conf,
-                "vlm_candidate": r.vlm_candidate,
-                "final_text": r.final_text,
-                "normalized": r.normalized,
-                "source": r.source,
-                "needs_review": r.needs_review,
-                "matched": r.matched,
-                "gold_text": r.gold_text,
-                "symbols": r.symbols,
-                "tools": r.tools,
-                "index": r.index,
-            }
-            for r in result.boxes
-        ],
+        "boxes": [_box_to_dict(r) for r in result.boxes],
     }
 
 

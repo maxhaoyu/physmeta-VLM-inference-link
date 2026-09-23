@@ -172,6 +172,11 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_input(m.group(1))
             return
 
+        m = re.fullmatch(r"/api/inference/jobs/([^/]+)/result", p)
+        if m:
+            self._handle_result_get(m.group(1))
+            return
+
         m = re.fullmatch(r"/api/inference/jobs/([^/]+)", p)
         if m:
             self._handle_status(m.group(1))
@@ -221,23 +226,49 @@ class Handler(BaseHTTPRequestHandler):
             return
         boundary = boundary.group(1).strip().strip('"').encode()
 
-        # 取 image 字段
+        # 取 image 字段（及可选 task_type / region / options）
         image_bytes = None
         filename = "upload.png"
+        task_type = "full"
+        region = None
+        extra_options: dict = {}
+
         for part in body.split(b"--" + boundary):
-            if b'name="image"' not in part:
+            if b"Content-Disposition" not in part or b'name="' not in part:
                 continue
             header, _, data = part.partition(b"\r\n\r\n")
-            m = re.search(rb'filename="([^"]*)"', header)
-            if m:
-                filename = m.group(1).decode("utf-8", "ignore") or "upload.png"
+            name_m = re.search(rb'name="([^"]*)"', header)
+            if not name_m:
+                continue
+            name = name_m.group(1).decode("utf-8", "ignore")
             data = data.rsplit(b"\r\n", 1)[0] if data.endswith(b"\r\n") else data
-            image_bytes = data
-            break
+            if name == "image":
+                m = re.search(rb'filename="([^"]*)"', header)
+                if m:
+                    filename = m.group(1).decode("utf-8", "ignore") or "upload.png"
+                image_bytes = data
+            elif name == "task_type":
+                task_type = data.decode("utf-8", "ignore").strip() or "full"
+            elif name == "region":
+                try:
+                    region = json.loads(data.decode("utf-8", "ignore"))
+                except (ValueError, UnicodeDecodeError):
+                    region = None
+            elif name == "options":
+                try:
+                    extra_options = json.loads(data.decode("utf-8", "ignore")) or {}
+                except (ValueError, UnicodeDecodeError):
+                    extra_options = {}
 
         if not image_bytes:
             self._json(400, {"error": "未找到 image 字段"})
             return
+
+        options = dict(extra_options)
+        if task_type and task_type != "full":
+            options["task_type"] = task_type
+        if region:
+            options["region"] = region
 
         job_id = new_job_id()
         input_path = STORAGE_DIR / "input" / job_id
@@ -246,9 +277,10 @@ class Handler(BaseHTTPRequestHandler):
 
         conn = get_db()
         conn.execute(
-            "INSERT INTO inference_jobs (id, input_path, input_sha256, input_bytes, filename, status) "
-            "VALUES (?, ?, ?, ?, ?, 'pending')",
-            (job_id, str(input_path), digest, len(image_bytes), filename),
+            "INSERT INTO inference_jobs (id, input_path, input_sha256, input_bytes, filename, options, status) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'pending')",
+            (job_id, str(input_path), digest, len(image_bytes), filename,
+             json.dumps(options, ensure_ascii=False)),
         )
         conn.commit()
         conn.close()
@@ -387,6 +419,32 @@ class Handler(BaseHTTPRequestHandler):
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         })
+
+    # ---------------- 取回结果（前端/上传服务轮询用） ----------------
+    def _handle_result_get(self, job_id: str):
+        row = job_row(job_id)
+        if row is None:
+            self._json(404, {"error": "任务不存在"})
+            return
+        if row["status"] == "failed":
+            self._json(200, {"status": "failed", "error": row["error"]})
+            return
+        if row["status"] != "done" or not row["result_path"]:
+            self._json(200, {"status": row["status"]})
+            return
+        result_path = Path(row["result_path"])
+        if not result_path.is_file():
+            self._json(200, {"status": row["status"]})
+            return
+        try:
+            import zipfile
+            with zipfile.ZipFile(result_path) as zf:
+                data = zf.read("result.json")
+            payload = json.loads(data.decode("utf-8"))
+        except (KeyError, zipfile.BadZipFile, json.JSONDecodeError, OSError):
+            self._json(500, {"error": "结果包损坏"})
+            return
+        self._json(200, {"status": "done", "result": payload})
 
     def log_message(self, fmt, *args):
         pass  # 静默访问日志
