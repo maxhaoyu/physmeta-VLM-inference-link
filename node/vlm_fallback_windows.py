@@ -40,6 +40,10 @@ _LOADED_FOR: tuple[str, str] | None = None
 
 DEFAULT_PROMPT = "读出图中标注的文本内容。"
 DEFAULT_MAX_TOKENS = 32
+# MiniCPM-V 的 scale_resolution：crop 放大后最长边不得超过该值，否则会触发 slice 切分，
+# 而 transformers 5.17.0 的 MiniCPM-V 4.6 在部分尺寸下 source/slice patch 数不一致，
+# 导致 vit_merger reshape 崩溃（RuntimeError: shape mismatch）。
+_MAX_EDGE = 448
 
 
 def _load(model_path: Path, adapter_path: Path | None = None):
@@ -106,7 +110,12 @@ def _crop_box(image: Image.Image, box: dict[str, Any], pad: int = 12) -> Image.I
     right = min(image.width, x + w + pad)
     bottom = min(image.height, y + h + pad)
     crop = image.crop((left, top, right, bottom))
-    return crop.resize((crop.width * 2, crop.height * 2), Image.LANCZOS)
+    # 放大 2x 提升小字识别；但限制最长边 ≤ _MAX_EDGE（448），避免触发 slice 切分
+    # （slice 切分在部分尺寸下 patch 数不一致会崩溃，见 _MAX_EDGE 注释）。
+    scale = min(2.0, _MAX_EDGE / max(crop.width, crop.height))
+    new_w = max(1, round(crop.width * scale))
+    new_h = max(1, round(crop.height * scale))
+    return crop.resize((new_w, new_h), Image.LANCZOS)
 
 
 def read_box(
