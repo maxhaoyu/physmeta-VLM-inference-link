@@ -377,13 +377,20 @@ def run_loop(config: dict[str, Any], once: bool) -> int:
                 {"wait_seconds": long_poll},
                 timeout=max(10.0, long_poll + 5.0),
             )
+            if connection_failures:
+                print("[节点] 控制链路已恢复", file=sys.stderr)
             connection_failures = 0
         except AgentAuthenticationError:
             raise
         except AgentError as exc:
             connection_failures += 1
-            delay = min(15.0, float(2 ** min(3, max(1, connection_failures))))
-            print(f"控制链路中断，{delay:.0f} 秒后重试：{exc}", file=sys.stderr)
+            delay = min(8.0, float(2 ** min(3, max(1, connection_failures))))
+            # 日志降噪：间歇性 SSL/网络抖动会自动恢复，避免每条都刷屏
+            if connection_failures == 1:
+                print(f"[节点] 控制链路中断：{exc}", file=sys.stderr)
+                print("[节点] 自动重试中（网络/代理间歇性中断通常很快恢复）...", file=sys.stderr)
+            elif connection_failures % 5 == 0:
+                print(f"[节点] 控制链路持续中断（已重试 {connection_failures} 次，最近错误：{exc}）", file=sys.stderr)
             if once:
                 raise
             time.sleep(delay)
