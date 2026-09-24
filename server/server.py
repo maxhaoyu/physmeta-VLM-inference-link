@@ -43,6 +43,10 @@ NODE_TOKEN = os.environ.get("INFERENCE_NODE_TOKEN", "")
 UPLOAD_TOKEN = os.environ.get("INFERENCE_UPLOAD_TOKEN", "")  # 空则不校验上传
 HOST = os.environ.get("INFERENCE_HOST", "0.0.0.0")
 PORT = int(os.environ.get("INFERENCE_PORT", "8090"))
+# 上传大小上限（对齐 bubble-ocr 的 50MB），防止公网经 Caddy 访问 upload 时被大文件打爆存储
+MAX_UPLOAD_BYTES = int(os.environ.get("INFERENCE_MAX_UPLOAD", str(50 * 1024 * 1024)))
+# claimed 任务超时回收：节点崩溃后，超过该时长的 claimed 任务重置为 pending 重新派发
+CLAIM_TIMEOUT_SECONDS = int(os.environ.get("INFERENCE_CLAIM_TIMEOUT", "300"))
 
 (STORAGE_DIR / "input").mkdir(parents=True, exist_ok=True)
 (STORAGE_DIR / "result").mkdir(parents=True, exist_ok=True)
@@ -110,6 +114,45 @@ def next_pending_job():
     return row
 
 
+def _reap_stale_claimed(conn: sqlite3.Connection) -> None:
+    """把超时未完成的 claimed 任务重置为 pending（节点崩溃兜底，避免任务永久卡死）。"""
+    conn.execute(
+        "UPDATE inference_jobs SET status='pending', node_id=NULL, run_token=NULL "
+        "WHERE status='claimed' AND updated_at < datetime('now', ?)",
+        (f"-{CLAIM_TIMEOUT_SECONDS} seconds",),
+    )
+
+
+def claim_next_pending(node_id: str, run_token: str):
+    """原子领取队首 pending 任务，返回任务行或 None。
+
+    用 BEGIN IMMEDIATE 加写锁，保证「查 pending + 标记 claimed」原子，
+    避免多节点并发把同一任务重复领取；顺带回收超时未完成的 claimed 任务。
+    """
+    conn = get_db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        _reap_stale_claimed(conn)
+        row = conn.execute(
+            "SELECT * FROM inference_jobs WHERE status='pending' ORDER BY created_at ASC LIMIT 1"
+        ).fetchone()
+        if row is None:
+            conn.rollback()
+            return None
+        conn.execute(
+            "UPDATE inference_jobs SET status='claimed', node_id=?, run_token=?, "
+            "updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='pending'",
+            (node_id, run_token, row["id"]),
+        )
+        conn.commit()
+        return dict(row)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def update_status(job_id: str, status: str, **fields):
     sets = ["status = ?", "updated_at = CURRENT_TIMESTAMP"]
     values = [status]
@@ -172,6 +215,11 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_input(m.group(1))
             return
 
+        m = re.fullmatch(r"/api/inference/jobs/([^/]+)/result", p)
+        if m:
+            self._handle_result_get(m.group(1))
+            return
+
         m = re.fullmatch(r"/api/inference/jobs/([^/]+)", p)
         if m:
             self._handle_status(m.group(1))
@@ -214,6 +262,10 @@ class Handler(BaseHTTPRequestHandler):
         if not ctype.startswith("multipart/form-data"):
             self._json(400, {"error": "需要 multipart/form-data"})
             return
+        # 大小上限：读 body 前拦截，避免超大文件耗尽存储/内存
+        if int(self.headers.get("Content-Length", 0)) > MAX_UPLOAD_BYTES:
+            self._json(413, {"error": f"文件超过大小上限 {MAX_UPLOAD_BYTES // (1024*1024)}MB"})
+            return
         body = self._read_body()
         boundary = re.search(r"boundary=([^;]+)", ctype)
         if not boundary:
@@ -221,23 +273,49 @@ class Handler(BaseHTTPRequestHandler):
             return
         boundary = boundary.group(1).strip().strip('"').encode()
 
-        # 取 image 字段
+        # 取 image 字段（及可选 task_type / region / options）
         image_bytes = None
         filename = "upload.png"
+        task_type = "full"
+        region = None
+        extra_options: dict = {}
+
         for part in body.split(b"--" + boundary):
-            if b'name="image"' not in part:
+            if b"Content-Disposition" not in part or b'name="' not in part:
                 continue
             header, _, data = part.partition(b"\r\n\r\n")
-            m = re.search(rb'filename="([^"]*)"', header)
-            if m:
-                filename = m.group(1).decode("utf-8", "ignore") or "upload.png"
+            name_m = re.search(rb'name="([^"]*)"', header)
+            if not name_m:
+                continue
+            name = name_m.group(1).decode("utf-8", "ignore")
             data = data.rsplit(b"\r\n", 1)[0] if data.endswith(b"\r\n") else data
-            image_bytes = data
-            break
+            if name == "image":
+                m = re.search(rb'filename="([^"]*)"', header)
+                if m:
+                    filename = m.group(1).decode("utf-8", "ignore") or "upload.png"
+                image_bytes = data
+            elif name == "task_type":
+                task_type = data.decode("utf-8", "ignore").strip() or "full"
+            elif name == "region":
+                try:
+                    region = json.loads(data.decode("utf-8", "ignore"))
+                except (ValueError, UnicodeDecodeError):
+                    region = None
+            elif name == "options":
+                try:
+                    extra_options = json.loads(data.decode("utf-8", "ignore")) or {}
+                except (ValueError, UnicodeDecodeError):
+                    extra_options = {}
 
         if not image_bytes:
             self._json(400, {"error": "未找到 image 字段"})
             return
+
+        options = dict(extra_options)
+        if task_type and task_type != "full":
+            options["task_type"] = task_type
+        if region:
+            options["region"] = region
 
         job_id = new_job_id()
         input_path = STORAGE_DIR / "input" / job_id
@@ -246,9 +324,10 @@ class Handler(BaseHTTPRequestHandler):
 
         conn = get_db()
         conn.execute(
-            "INSERT INTO inference_jobs (id, input_path, input_sha256, input_bytes, filename, status) "
-            "VALUES (?, ?, ?, ?, ?, 'pending')",
-            (job_id, str(input_path), digest, len(image_bytes), filename),
+            "INSERT INTO inference_jobs (id, input_path, input_sha256, input_bytes, filename, options, status) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'pending')",
+            (job_id, str(input_path), digest, len(image_bytes), filename,
+             json.dumps(options, ensure_ascii=False)),
         )
         conn.commit()
         conn.close()
@@ -266,20 +345,18 @@ class Handler(BaseHTTPRequestHandler):
         wait_seconds = max(0.0, min(30.0, float(payload.get("wait_seconds") or 5)))
 
         deadline = time.time() + wait_seconds
+        node_id = self.headers.get("X-Inference-Node-ID", "")
         while True:
-            row = next_pending_job()
+            run_token = secrets.token_hex(32)
+            row = claim_next_pending(node_id, run_token)
             if row is not None:
-                run_token = secrets.token_hex(32)
-                node_id = self.headers.get("X-Inference-Node-ID", "")
-                update_status(row["id"], "claimed", node_id=node_id, run_token=run_token)
-                job = dict(row)
                 self._json(200, {
                     "job": {
-                        "id": job["id"],
-                        "filename": job["filename"],
-                        "input_bytes": job["input_bytes"],
-                        "input_sha256": job["input_sha256"],
-                        "options": json.loads(job["options"]) if job["options"] else {},
+                        "id": row["id"],
+                        "filename": row["filename"],
+                        "input_bytes": row["input_bytes"],
+                        "input_sha256": row["input_sha256"],
+                        "options": json.loads(row["options"]) if row["options"] else {},
                     },
                     "run_token": run_token,
                 })
@@ -387,6 +464,37 @@ class Handler(BaseHTTPRequestHandler):
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         })
+
+    # ---------------- 取回结果（前端/上传服务轮询用） ----------------
+    def _handle_result_get(self, job_id: str):
+        # 该接口会经 Caddy 暴露公网，必须校验上传令牌（与 _handle_upload 一致），
+        # 否则任何人可凭 job_id 读取识别结果，破坏「图纸不出内网」红线。
+        if UPLOAD_TOKEN and not token_ok(self._bearer(), UPLOAD_TOKEN):
+            self._json(401, {"error": "上传认证失败"})
+            return
+        row = job_row(job_id)
+        if row is None:
+            self._json(404, {"error": "任务不存在"})
+            return
+        if row["status"] == "failed":
+            self._json(200, {"status": "failed", "error": row["error"]})
+            return
+        if row["status"] != "done" or not row["result_path"]:
+            self._json(200, {"status": row["status"]})
+            return
+        result_path = Path(row["result_path"])
+        if not result_path.is_file():
+            self._json(200, {"status": row["status"]})
+            return
+        try:
+            import zipfile
+            with zipfile.ZipFile(result_path) as zf:
+                data = zf.read("result.json")
+            payload = json.loads(data.decode("utf-8"))
+        except (KeyError, zipfile.BadZipFile, json.JSONDecodeError, OSError):
+            self._json(500, {"error": "结果包损坏"})
+            return
+        self._json(200, {"status": "done", "result": payload})
 
     def log_message(self, fmt, *args):
         pass  # 静默访问日志
