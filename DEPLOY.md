@@ -142,7 +142,8 @@ volumes:
 Windows 节点通过公网域名 `https://yolobubble.physmeta.cn/api/inference/*` 访问队列。
 所以 Caddy 必须把 `/api/inference/*` 前缀路由到 inference-queue，其余仍走 bubble-ocr。
 
-在 `yolobubble.physmeta.cn` 站点里，**在默认 `reverse_proxy` 之前**加一段：
+在 `yolobubble.physmeta.cn` 站点里，**在现有的 `reverse_proxy` 行之前**加一段 `handle` 路由；
+现有的 `reverse_proxy` 行**保持原样不动**（它的目标端口以服务器现状为准，仓库里 `deploy/caddy-yolobubble.Caddyfile` 是 `127.0.0.1:8000`）：
 
 ```
 yolobubble.physmeta.cn {
@@ -150,9 +151,9 @@ yolobubble.physmeta.cn {
     handle /api/inference/* {
         reverse_proxy 127.0.0.1:18090
     }
-    # 其余请求仍走 bubble-ocr（注意按你现状的回环端口，可能是 18000 或 8000）
+    # 其余请求仍走 bubble-ocr（这一行是服务器现状，别改，可能是 8000）
     handle {
-        reverse_proxy 127.0.0.1:18000
+        reverse_proxy 127.0.0.1:8000
     }
     # ... 保留原有 request_body 上限 50MB、安全头、日志等 ...
 }
