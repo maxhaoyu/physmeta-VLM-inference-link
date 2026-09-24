@@ -6,7 +6,7 @@
   "bubble_src": "C:\\PhysMetaInference\\bubble-ocr-app\\src",
   "jobs_root": "C:\\PhysMetaInference\\inference-jobs",
   "weights": "C:\\PhysMetaInference\\bubble-ocr-app\\models\\yolo\\cv88-baseline-epoch11.pt",
-  "vlm_model": "C:\\PhysMetaInference\\bubble-ocr-app\\models\\vlm\\MiniCPM-V-4.6-hf",
-  "vlm_adapter": "C:\\PhysMetaInference\\bubble-ocr-app\\models\\adapters\\checkpoint-600",
+  "vlm_model": "C:\\PhysMetaInference\\bubble-ocr-app\\models\\vlm\\MiniCPM-V-4.6-hf-ra600",
+  "vlm_adapter": "C:\\PhysMetaInference\\bubble-ocr-app\\models\\adapters\\checkpoint-150-best",
   "use_ocr": false
 }

@@ -205,6 +205,8 @@ curl -f https://yolobubble.physmeta.cn/api/inference/healthz 2>/dev/null || \
 - 节点目录已就绪：`C:\PhysMetaInference-ocr\`（`agent.py` + `inference-node.json` + `vlm_fallback_windows.py`）。
 - `inference-node.json` 里 `server=https://yolobubble.physmeta.cn`、`node_id=windows-5060ti-01`、
   `use_ocr=false`，`token` 待填（就是上面下发的 NODE_TOKEN）。
+- **VLM 模型版本**：基座 = `models/vlm/MiniCPM-V-4.6-hf-ra600`（已 merge checkpoint-600），
+  adapter = `models/adapters/checkpoint-150-best`。**不能挂原始 `MiniCPM-V-4.6-hf`**，详见 `docs/MODEL_VERSION.md`。
 - 用户填完 token 后，在 Windows 上运行一个常驻进程：
   ```
   C:\Users\maxzh\WorkBuddy\2026-09-23-16-10-09\bubble-ocr-app\.venv\Scripts\python.exe ^
@@ -218,3 +220,4 @@ curl -f https://yolobubble.physmeta.cn/api/inference/healthz 2>/dev/null || \
 - inference-queue 不要暴露公网端口（只用 `127.0.0.1:18090` 回环 + Caddy 反代）。
 - token 走环境变量 / secrets，不要硬编码进镜像或提交到 git。
 - 图纸数据不落公网第三方；`INFERENCE_STORAGE` 用独立数据卷。
+- **VLM 基座必须挂 ra600（已 merge checkpoint-600），adapter 用 checkpoint-150-best，不能挂原始 hf**（见 `docs/MODEL_VERSION.md`）。
