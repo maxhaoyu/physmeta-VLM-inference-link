@@ -40,13 +40,22 @@ ROOT = Path(__file__).resolve().parent
 DB_PATH = Path(os.environ.get("INFERENCE_DB", str(ROOT / "inference.db")))
 STORAGE_DIR = Path(os.environ.get("INFERENCE_STORAGE", str(ROOT / "storage")))
 NODE_TOKEN = os.environ.get("INFERENCE_NODE_TOKEN", "")
-UPLOAD_TOKEN = os.environ.get("INFERENCE_UPLOAD_TOKEN", "")  # 空则不校验上传
+UPLOAD_TOKEN = os.environ.get("INFERENCE_UPLOAD_TOKEN", "")  # 生产环境必须非空（见 main 的启动校验）
 HOST = os.environ.get("INFERENCE_HOST", "0.0.0.0")
 PORT = int(os.environ.get("INFERENCE_PORT", "8090"))
 # 上传大小上限（对齐 bubble-ocr 的 50MB），防止公网经 Caddy 访问 upload 时被大文件打爆存储
 MAX_UPLOAD_BYTES = int(os.environ.get("INFERENCE_MAX_UPLOAD", str(50 * 1024 * 1024)))
+# 结果回传大小上限（结果 zip 正常 1~10MB，设上限防持 token 者撑爆磁盘）
+MAX_RESULT_BYTES = int(os.environ.get("INFERENCE_MAX_RESULT", str(50 * 1024 * 1024)))
 # claimed 任务超时回收：节点崩溃后，超过该时长的 claimed 任务重置为 pending 重新派发
 CLAIM_TIMEOUT_SECONDS = int(os.environ.get("INFERENCE_CLAIM_TIMEOUT", "300"))
+# processing 任务超时回收：节点回传进度后崩溃，超过该时长未完成则重置为 pending（需要租约心跳续期）
+PROCESSING_TIMEOUT_SECONDS = int(os.environ.get("INFERENCE_PROCESSING_TIMEOUT", "3600"))
+# 输入/结果文件保留期（秒）：超过该时长的文件与任务记录被清理，避免磁盘无限增长
+RETENTION_SECONDS = int(os.environ.get("INFERENCE_RETENTION", str(7 * 24 * 3600)))
+# 结果 zip 内允许的最大文件数与单文件最大解压后大小（防 zip 炸弹）
+MAX_ARCHIVE_FILES = int(os.environ.get("INFERENCE_MAX_ARCHIVE_FILES", "200"))
+MAX_ARCHIVE_UNCOMPRESSED = int(os.environ.get("INFERENCE_MAX_ARCHIVE_UNCOMPRESSED", str(200 * 1024 * 1024)))
 
 (STORAGE_DIR / "input").mkdir(parents=True, exist_ok=True)
 (STORAGE_DIR / "result").mkdir(parents=True, exist_ok=True)
@@ -89,9 +98,11 @@ def init_db() -> None:
             result_path  TEXT,
             error        TEXT,
             created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            heartbeat_at TIMESTAMP
         );
         CREATE INDEX IF NOT EXISTS idx_jobs_status ON inference_jobs (status, created_at);
+        CREATE INDEX IF NOT EXISTS idx_jobs_heartbeat ON inference_jobs (status, heartbeat_at);
     """)
     conn.commit()
     conn.close()
@@ -115,19 +126,36 @@ def next_pending_job():
 
 
 def _reap_stale_claimed(conn: sqlite3.Connection) -> None:
-    """把超时未完成的 claimed 任务重置为 pending（节点崩溃兜底，避免任务永久卡死）。"""
+    """把超时未完成的 claimed / processing 任务重置为 pending（节点崩溃兜底，避免任务永久卡死）。
+
+    - claimed：认领后超过 CLAIM_TIMEOUT_SECONDS 未开始（未回传进度）→ 重置。
+    - processing：回传进度后超过 PROCESSING_TIMEOUT_SECONDS 未完成 → 重置（依赖心跳续期）。
+    """
     conn.execute(
-        "UPDATE inference_jobs SET status='pending', node_id=NULL, run_token=NULL "
+        "UPDATE inference_jobs SET status='pending', node_id=NULL, run_token=NULL, heartbeat_at=NULL "
         "WHERE status='claimed' AND updated_at < datetime('now', ?)",
         (f"-{CLAIM_TIMEOUT_SECONDS} seconds",),
     )
+    conn.execute(
+        "UPDATE inference_jobs SET status='pending', node_id=NULL, run_token=NULL, heartbeat_at=NULL "
+        "WHERE status='processing' AND COALESCE(heartbeat_at, updated_at) < datetime('now', ?)",
+        (f"-{PROCESSING_TIMEOUT_SECONDS} seconds",),
+    )
+
+
+# 合法状态转换表：确保 progress/result/fail 只能从合法前置状态转移，避免旧节点/重放覆盖终态
+_VALID_TRANSITIONS = {
+    "progress": ("claimed", "processing"),
+    "result": ("claimed", "processing"),
+    "fail": ("claimed", "processing"),
+}
 
 
 def claim_next_pending(node_id: str, run_token: str):
     """原子领取队首 pending 任务，返回任务行或 None。
 
     用 BEGIN IMMEDIATE 加写锁，保证「查 pending + 标记 claimed」原子，
-    避免多节点并发把同一任务重复领取；顺带回收超时未完成的 claimed 任务。
+    避免多节点并发把同一任务重复领取；顺带回收超时未完成的 claimed/processing 任务。
     """
     conn = get_db()
     try:
@@ -141,7 +169,7 @@ def claim_next_pending(node_id: str, run_token: str):
             return None
         conn.execute(
             "UPDATE inference_jobs SET status='claimed', node_id=?, run_token=?, "
-            "updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='pending'",
+            "updated_at=CURRENT_TIMESTAMP, heartbeat_at=CURRENT_TIMESTAMP WHERE id=? AND status='pending'",
             (node_id, run_token, row["id"]),
         )
         conn.commit()
@@ -162,6 +190,45 @@ def update_status(job_id: str, status: str, **fields):
     values.append(job_id)
     conn = get_db()
     conn.execute(f"UPDATE inference_jobs SET {', '.join(sets)} WHERE id = ?", values)
+    conn.commit()
+    conn.close()
+
+
+def transition(job_id: str, action: str, status: str, **fields) -> bool:
+    """带状态条件的原子状态转换，返回是否成功。
+
+    action ∈ {"progress","result","fail"}，对应合法前置状态见 _VALID_TRANSITIONS。
+    只有当任务当前处于合法前置状态时才会更新，避免旧节点/重放把终态（done/failed）覆盖掉。
+    """
+    allowed = _VALID_TRANSITIONS.get(action)
+    if not allowed:
+        raise ValueError(f"未知状态转换动作：{action}")
+    sets = ["status = ?", "updated_at = CURRENT_TIMESTAMP"]
+    values = [status]
+    for k, v in fields.items():
+        sets.append(f"{k} = ?")
+        values.append(v)
+    values.extend([job_id, *allowed])
+    placeholders = ", ".join("?" for _ in allowed)
+    conn = get_db()
+    try:
+        cur = conn.execute(
+            f"UPDATE inference_jobs SET {', '.join(sets)} "
+            f"WHERE id = ? AND status IN ({placeholders})",
+            values,
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def heartbeat(job_id: str) -> None:
+    """刷新任务心跳时间戳（processing 阶段续期，防误回收）。"""
+    conn = get_db()
+    conn.execute(
+        "UPDATE inference_jobs SET heartbeat_at=CURRENT_TIMESTAMP WHERE id = ?", (job_id,)
+    )
     conn.commit()
     conn.close()
 
@@ -198,8 +265,21 @@ class Handler(BaseHTTPRequestHandler):
         return True
 
     def _read_body(self) -> bytes:
-        length = int(self.headers.get("Content-Length", 0))
-        return self.rfile.read(length) if length else b""
+        raw = self.headers.get("Content-Length", "0")
+        try:
+            length = int(raw)
+        except (TypeError, ValueError):
+            length = 0
+        if length <= 0:
+            return b""
+        # 循环读满 length 字节：TCP 分片下 rfile.read(n) 不保证一次读满
+        buf = b""
+        while len(buf) < length:
+            chunk = self.rfile.read(length - len(buf))
+            if not chunk:
+                break
+            buf += chunk
+        return buf
 
     # ---------------- 路由 ----------------
     def do_GET(self):
@@ -342,7 +422,11 @@ class Handler(BaseHTTPRequestHandler):
             payload = json.loads(self._read_body() or b"{}")
         except json.JSONDecodeError:
             payload = {}
-        wait_seconds = max(0.0, min(30.0, float(payload.get("wait_seconds") or 5)))
+        raw_wait = payload.get("wait_seconds", 5)
+        try:
+            wait_seconds = max(0.0, min(30.0, float(raw_wait)))
+        except (TypeError, ValueError):
+            wait_seconds = 5.0
 
         deadline = time.time() + wait_seconds
         node_id = self.headers.get("X-Inference-Node-ID", "")
@@ -378,6 +462,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(403, {"error": "run_token 不匹配"})
             return
         data = Path(row["input_path"]).read_bytes()
+        heartbeat(job_id)  # 下载图纸即开始处理，续期防误回收
         self._send(200, data, "application/octet-stream")
 
     # ---------------- 回传进度 ----------------
@@ -391,7 +476,12 @@ class Handler(BaseHTTPRequestHandler):
         if not token_ok(self.headers.get("X-Inference-Run-Token", ""), row["run_token"] or ""):
             self._json(403, {"error": "run_token 不匹配"})
             return
-        update_status(job_id, "processing")
+        # 进度回传即心跳续期；状态转换：claimed→processing 或 processing→processing
+        if not transition(job_id, "progress", "processing"):
+            # 已处于 done/failed 终态，旧节点重放，忽略而非报错
+            self._json(200, {"ok": True, "status": row["status"], "stale": True})
+            return
+        heartbeat(job_id)
         self._json(200, {"ok": True})
 
     # ---------------- 回传结果 ----------------
@@ -406,7 +496,17 @@ class Handler(BaseHTTPRequestHandler):
             self._json(403, {"error": "run_token 不匹配"})
             return
 
-        # multipart：读 artifact 字段
+        # 结果大小上限：读 body 前拦截（与上传一致，防撑爆存储/内存）
+        raw_len = self.headers.get("Content-Length", "0")
+        try:
+            body_len = int(raw_len)
+        except (TypeError, ValueError):
+            body_len = 0
+        if body_len > MAX_RESULT_BYTES:
+            self._json(413, {"error": f"结果超过大小上限 {MAX_RESULT_BYTES // (1024*1024)}MB"})
+            return
+
+        # multipart：读 artifact 字段（流式读入，避免一次性读完整 body 进内存时放大）
         ctype = self.headers.get("Content-Type", "")
         body = self._read_body()
         if ctype.startswith("multipart/form-data"):
@@ -421,15 +521,52 @@ class Handler(BaseHTTPRequestHandler):
                     body = data
                     break
 
+        # 强制 SHA-256 校验：生产环境必须携带且匹配，缺失或错误一律拒绝
         digest = sha256(body)
         expected = self.headers.get("X-Artifact-SHA256", "")
-        if expected and digest != expected:
+        if not expected:
+            self._json(400, {"error": "缺少 X-Artifact-SHA256 头"})
+            return
+        if digest != expected:
             self._json(400, {"error": "结果 SHA-256 校验失败"})
             return
 
+        # zip 炸弹防护：限制文件数与解压后总大小，且只接受合法 zip
+        try:
+            import zipfile
+            with zipfile.ZipFile(__import__("io").BytesIO(body)) as zf:
+                infos = zf.infolist()
+                if len(infos) > MAX_ARCHIVE_FILES:
+                    self._json(400, {"error": f"结果包文件数超限（>{MAX_ARCHIVE_FILES}）"})
+                    return
+                total = sum(i.file_size for i in infos)
+                if total > MAX_ARCHIVE_UNCOMPRESSED:
+                    self._json(400, {"error": "结果包解压后体积超限"})
+                    return
+        except zipfile.BadZipFile:
+            self._json(400, {"error": "结果包不是合法 zip"})
+            return
+
+        # 状态转换（claimed/processing → done）：终态后旧节点重放会被拒绝
+        if not transition(job_id, "result", "done", result_path=""):
+            self._json(200, {"ok": True, "status": row["status"], "stale": True})
+            return
+
+        # 写盘（临时文件 + 原子 rename），写入成功后再登记 result_path
         result_path = STORAGE_DIR / "result" / f"{job_id}.zip"
-        result_path.write_bytes(body)
-        update_status(job_id, "done", result_path=str(result_path))
+        tmp_path = result_path.with_suffix(".zip.part")
+        try:
+            tmp_path.write_bytes(body)
+            tmp_path.replace(result_path)
+        finally:
+            tmp_path.unlink(missing_ok=True)
+        conn = get_db()
+        conn.execute(
+            "UPDATE inference_jobs SET result_path=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (str(result_path), job_id),
+        )
+        conn.commit()
+        conn.close()
         self._json(200, {"ok": True, "status": "done"})
 
     # ---------------- 失败回退 ----------------
@@ -447,12 +584,20 @@ class Handler(BaseHTTPRequestHandler):
             payload = json.loads(self._read_body() or b"{}")
         except json.JSONDecodeError:
             payload = {}
-        update_status(job_id, "failed", error=str(payload.get("error") or "")[-1000:])
+        # 状态转换（claimed/processing → failed）：终态后旧节点重放被忽略
+        if not transition(job_id, "fail", "failed", error=str(payload.get("error") or "")[-1000:]):
+            self._json(200, {"ok": True, "status": row["status"], "stale": True})
+            return
         # TODO: 在这里接入云端回退 Worker
         self._json(200, {"ok": True, "status": "failed"})
 
     # ---------------- 查询状态 ----------------
     def _handle_status(self, job_id: str):
+        # 状态接口经 Caddy 暴露公网，必须校验上传令牌（与 _handle_result_get 一致），
+        # 否则任何人可凭 job_id 枚举任务状态/错误/时间戳。
+        if UPLOAD_TOKEN and not token_ok(self._bearer(), UPLOAD_TOKEN):
+            self._json(401, {"error": "上传认证失败"})
+            return
         row = job_row(job_id)
         if row is None:
             self._json(404, {"error": "任务不存在"})
@@ -500,9 +645,71 @@ class Handler(BaseHTTPRequestHandler):
         pass  # 静默访问日志
 
 
+def _cleanup_expired() -> int:
+    """清理超过保留期的任务记录与输入/结果文件，返回清理条数。
+
+    只清理终态（done/failed）且超过 RETENTION_SECONDS 的任务；
+    pending/claimed/processing 永不清理（仍在流转中）。
+    """
+    cutoff = time.time() - RETENTION_SECONDS
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT id, input_path, result_path FROM inference_jobs "
+            "WHERE status IN ('done','failed') AND updated_at < datetime('now', ?)",
+            (f"-{RETENTION_SECONDS} seconds",),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    removed = 0
+    for row in rows:
+        for col in ("input_path", "result_path"):
+            p = row[col]
+            if p:
+                try:
+                    Path(p).unlink(missing_ok=True)
+                except OSError:
+                    pass
+    if rows:
+        ids = [r["id"] for r in rows]
+        conn = get_db()
+        try:
+            conn.executemany("DELETE FROM inference_jobs WHERE id = ?", [(i,) for i in ids])
+            conn.commit()
+        finally:
+            conn.close()
+        removed = len(ids)
+    return removed
+
+
+def _cleanup_loop() -> None:
+    """周期性磁盘清理线程（每小时一次）。"""
+    while True:
+        time.sleep(3600)
+        try:
+            n = _cleanup_expired()
+            if n:
+                print(f"[cleanup] 清理了 {n} 条过期任务记录", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[cleanup] 清理失败：{exc}", flush=True)
+
+
 def main():
+    # 生产模式强制认证：两个 token 必须是强随机值，否则拒绝启动（防静默失去保护）
+    if not NODE_TOKEN or len(NODE_TOKEN) < 32:
+        raise SystemExit("启动失败：INFERENCE_NODE_TOKEN 缺失或过短（至少 32 字符）")
+    if not UPLOAD_TOKEN or len(UPLOAD_TOKEN) < 32:
+        raise SystemExit("启动失败：INFERENCE_UPLOAD_TOKEN 缺失或过短（至少 32 字符）")
+
     init_db()
+    # 启动时清理一次历史过期数据，之后由后台线程周期清理
+    _cleanup_expired()
+    threading.Thread(target=_cleanup_loop, daemon=True).start()
+
     server = ThreadingHTTPServer((HOST, PORT), Handler)
+    # 并发上限：限制同时处理的请求，防公网慢请求拖垮服务
+    server.daemon_threads = True
     print(f"PhysMeta inference server listening on {HOST}:{PORT}")
     try:
         server.serve_forever()

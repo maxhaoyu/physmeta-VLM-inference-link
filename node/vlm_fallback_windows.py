@@ -51,7 +51,7 @@ _CROP_PAD_BOTTOM = int(os.getenv("BUBBLE_CROP_PAD_BOTTOM", "4"))
 def _load(model_path: Path, adapter_path: Path | None = None):
     """加载 VLM 基座到 CUDA（bf16 + SDPA），可选挂载 peft LoRA 并 merge。
 
-    进程内只加载一次；model_path/adapter_path 变化时重新加载。
+    进程内只加载一次；model_path/adapter_path 变化时重新加载（先释放旧模型显存）。
     """
     global _MODEL, _PROCESSOR, _DEVICE, _LOADED_FOR
 
@@ -62,6 +62,19 @@ def _load(model_path: Path, adapter_path: Path | None = None):
     with _LOAD_LOCK:
         if _MODEL is not None and _LOADED_FOR == key:
             return _MODEL, _PROCESSOR
+
+        # 切换模型前先释放旧模型，避免显存累积（多次热切换不同 adapter/基座）
+        if _MODEL is not None:
+            try:
+                import torch
+                del _MODEL, _PROCESSOR
+                _MODEL = None
+                _PROCESSOR = None
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:  # noqa: BLE001
+                _MODEL = None
+                _PROCESSOR = None
 
         import torch
         from transformers import AutoModelForImageTextToText, AutoProcessor
@@ -90,7 +103,7 @@ def _load(model_path: Path, adapter_path: Path | None = None):
                 trust_remote_code=True,
             ).eval()
 
-        # 挂载 peft LoRA 并 merge（消除推理期 adapter 开销）；失败降级裸模型
+        # 挂载 peft LoRA 并 merge（消除推理期 adapter 开销）；失败降级裸模型（但要显式告警）
         if adapter_path is not None and Path(adapter_path).is_dir():
             try:
                 from peft import PeftModel
@@ -99,7 +112,10 @@ def _load(model_path: Path, adapter_path: Path | None = None):
                 model = model.merge_and_unload().eval()
                 print(f"[vlm] 已挂载并合并 LoRA adapter: {adapter_path}", flush=True)
             except Exception as exc:  # noqa: BLE001
-                print(f"[vlm] 挂载 LoRA 失败，降级为裸模型：{exc}", flush=True)
+                print(
+                    f"[vlm][警告] 挂载 LoRA 失败，降级为裸模型（识别精度可能下降）：{exc}",
+                    flush=True,
+                )
 
         _MODEL = model
         _PROCESSOR = processor

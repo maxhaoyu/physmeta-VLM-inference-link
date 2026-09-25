@@ -11,6 +11,17 @@ storage/
 inference-jobs/
 node/inference-node.json
 
+# 模型权重 / 大文件（红线：模型权重不入 git）
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.onnx
+models/
+adapters/
+*.gguf
+*.ckpt
+
 # 环境
 .env
 .DS_Store

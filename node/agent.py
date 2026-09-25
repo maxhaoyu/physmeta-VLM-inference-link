@@ -292,7 +292,7 @@ def load_config(path: Path) -> dict[str, Any]:
     if not isinstance(config, dict):
         raise AgentError("配置文件不是 JSON 对象")
 
-    server = str(config.get("server") or "https://app.physmeta.cn").rstrip("/")
+    server = str(config.get("server") or "https://yolobubble.physmeta.cn").rstrip("/")
     parsed = urlparse(server)
     if parsed.scheme != "https" and parsed.hostname not in {"127.0.0.1", "localhost"}:
         raise AgentError("远程推理服务必须使用 HTTPS")
@@ -387,6 +387,30 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _to_bool(value: Any, default: bool = False) -> bool:
+    """安全解析布尔值：正确处理字符串 'false'/'0'/'no'，避免 bool('false')==True 的坑。
+
+    表单/JSON 透传的 options 里 use_ocr/enable_vlm 可能是字符串，直接 bool() 会把
+    非空字符串都当成 True。这里按常见语义解析：
+      - bool 原样返回
+      - 字符串 'false'/'0'/'no'/'off'/'none'/''（不区分大小写）→ False
+      - 其余非空字符串 → True
+      - None → default
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in ("", "false", "0", "no", "off", "none", "null"):
+            return False
+        return True
+    return bool(value)
 
 
 def atomic_write_json(path: Path, payload: Any) -> None:
@@ -515,8 +539,8 @@ def run_inference(config: dict[str, Any], source: Path, options: dict[str, Any])
     adapter_dir = options.get("vlm_adapter") or config.get("vlm_adapter") or os.getenv("BUBBLE_VLM_ADAPTER") or bubble_config.VLM_ADAPTER_DIR
     conf = float(options.get("conf") or bubble_config.YOLO_CONF)
     low_conf = float(options.get("low_conf_threshold") or bubble_config.LOW_CONF_THRESHOLD)
-    enable_vlm = bool(options.get("enable_vlm", bubble_config.ENABLE_VLM))
-    use_ocr = bool(options.get("use_ocr", config.get("use_ocr", getattr(bubble_config, "USE_OCR", True))))
+    enable_vlm = _to_bool(options.get("enable_vlm", bubble_config.ENABLE_VLM))
+    use_ocr = _to_bool(options.get("use_ocr", config.get("use_ocr", getattr(bubble_config, "USE_OCR", True))))
 
     model_path = Path(str(model_dir)) if model_dir else None
     adapter_path = Path(str(adapter_dir)) if adapter_dir else None
@@ -705,10 +729,13 @@ def run_loop(config: dict[str, Any], once: bool) -> int:
             _set_state(state="idle", current_job=None)
             _log(f"[节点] 任务 {job_id} 完成（{elapsed:.1f}s）")
         except AgentAuthenticationError:
+            # 身份失效（token 被吊销/改错）：必须停止，交给人工排查，不能静默吞掉
             raise
-        except AgentError as exc:
+        except Exception as exc:  # noqa: BLE001 —— 兜底捕获一切异常（ImportError/模型加载失败/OOM/ValueError 等）
+            import traceback
             elapsed = time.time() - started
-            error = str(exc)[-1000:]
+            error = str(exc)[-1000:] or exc.__class__.__name__
+            tb = traceback.format_exc()
             _push_recent({
                 "id": job_id,
                 "type": task_type,
@@ -719,6 +746,7 @@ def run_loop(config: dict[str, Any], once: bool) -> int:
             _bump("failed")
             _set_state(state="idle", current_job=None)
             _log(f"[节点] 任务 {job_id} 失败：{error}")
+            _log(f"[节点] 任务 {job_id} 异常堆栈（末尾）：\n{tb[-2000:]}")
             try:
                 request_json(
                     config,
@@ -728,8 +756,8 @@ def run_loop(config: dict[str, Any], once: bool) -> int:
                     run_token=run_token,
                     timeout=10.0,
                 )
-            except AgentError:
-                pass
+            except Exception:  # noqa: BLE001 —— 回传失败也不能让节点崩溃
+                _log(f"[节点] 任务 {job_id} 回传 /fail 失败（服务端可能已回收该任务）")
             if once:
                 raise
             time.sleep(5)

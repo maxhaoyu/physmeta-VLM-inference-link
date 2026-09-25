@@ -1,5 +1,5 @@
 {
-  "server": "https://app.physmeta.cn",
+  "server": "https://yolobubble.physmeta.cn",
   "token": "在这里粘贴服务器下发的节点令牌（至少32字符）",
   "node_id": "windows-inference-01",
   "root": "C:\\PhysMetaInference",
