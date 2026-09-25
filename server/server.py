@@ -353,7 +353,12 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"error": "需要 multipart/form-data"})
             return
         # 大小上限：读 body 前拦截，避免超大文件耗尽存储/内存
-        if int(self.headers.get("Content-Length", 0)) > MAX_UPLOAD_BYTES:
+        try:
+            upload_len = int(self.headers.get("Content-Length", "0"))
+        except (TypeError, ValueError):
+            self._json(400, {"error": "Content-Length 无效"})
+            return
+        if upload_len > MAX_UPLOAD_BYTES:
             self._json(413, {"error": f"文件超过大小上限 {MAX_UPLOAD_BYTES // (1024*1024)}MB"})
             return
         body = self._read_body()
@@ -489,7 +494,6 @@ class Handler(BaseHTTPRequestHandler):
             self._json(403, {"error": "run_token 不匹配"})
             return
         # 进度回传即心跳续期；状态转换：claimed→processing 或 processing→processing
-        run_token = self.headers.get("X-Inference-Run-Token", "")
         if not transition(job_id, run_token, "progress", "processing"):
             # 已处于 done/failed 终态，旧节点重放，忽略而非报错
             self._json(200, {"ok": True, "status": row["status"], "stale": True})
@@ -563,8 +567,8 @@ class Handler(BaseHTTPRequestHandler):
 
         # 先写入带 run_token 的唯一文件，成功后再以同一 token 提交 done 状态。
         # 这样旧节点不会覆盖新租约的结果，也不会留下 done 但无文件的记录。
-        result_path = STORAGE_DIR / "result" / f"{job_id}.{run_token}.zip"
-        tmp_path = result_path.with_suffix(".zip.part")
+        result_path = STORAGE_DIR / "result" / f"{job_id}.{run_token}.{uuid.uuid4().hex}.zip"
+        tmp_path = result_path.with_name(f".{result_path.name}.part")
         try:
             tmp_path.write_bytes(body)
             tmp_path.replace(result_path)
