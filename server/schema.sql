@@ -15,7 +15,9 @@ CREATE TABLE IF NOT EXISTS inference_jobs (
     result_path  TEXT,                         -- 回传结果 zip 的存储路径
     error        TEXT,                         -- 失败原因
     created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    heartbeat_at TIMESTAMP                    -- processing 阶段租约心跳
 );
 
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON inference_jobs (status, created_at);
+CREATE INDEX IF NOT EXISTS idx_jobs_heartbeat ON inference_jobs (status, heartbeat_at);

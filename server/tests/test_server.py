@@ -65,31 +65,36 @@ class StateMachineTest(unittest.TestCase):
 
     def test_result_transition_from_claimed(self):
         self._insert("claimed", run_token="tok")
-        self.assertTrue(srv.transition(self.job_id, "result", "done", result_path="/tmp/r.zip"))
+        self.assertTrue(srv.transition(self.job_id, "tok", "result", "done", result_path="/tmp/r.zip"))
         self.assertEqual(srv.job_row(self.job_id)["status"], "done")
 
     def test_result_transition_from_pending_rejected(self):
         # pending 状态不允许直接 result（必须先 claimed）
         self._insert("pending")
-        self.assertFalse(srv.transition(self.job_id, "result", "done", result_path="/tmp/r.zip"))
+        self.assertFalse(srv.transition(self.job_id, "tok", "result", "done", result_path="/tmp/r.zip"))
         self.assertEqual(srv.job_row(self.job_id)["status"], "pending")
 
     def test_terminal_state_not_overwritten(self):
         # 终态 done 后，旧节点重放 result/fail 应被拒绝
         self._insert("done", run_token="tok")
-        self.assertFalse(srv.transition(self.job_id, "result", "done", result_path="/tmp/r2.zip"))
-        self.assertFalse(srv.transition(self.job_id, "fail", "failed", error="late"))
+        self.assertFalse(srv.transition(self.job_id, "tok", "result", "done", result_path="/tmp/r2.zip"))
+        self.assertFalse(srv.transition(self.job_id, "tok", "fail", "failed", error="late"))
         self.assertEqual(srv.job_row(self.job_id)["status"], "done")
 
     def test_fail_from_processing(self):
         self._insert("processing", run_token="tok")
-        self.assertTrue(srv.transition(self.job_id, "fail", "failed", error="boom"))
+        self.assertTrue(srv.transition(self.job_id, "tok", "fail", "failed", error="boom"))
         self.assertEqual(srv.job_row(self.job_id)["status"], "failed")
 
     def test_progress_from_claimed(self):
         self._insert("claimed", run_token="tok")
-        self.assertTrue(srv.transition(self.job_id, "progress", "processing"))
+        self.assertTrue(srv.transition(self.job_id, "tok", "progress", "processing"))
         self.assertEqual(srv.job_row(self.job_id)["status"], "processing")
+
+    def test_old_run_token_cannot_update_reassigned_job(self):
+        self._insert("claimed", run_token="new-token")
+        self.assertFalse(srv.transition(self.job_id, "old-token", "fail", "failed", error="late"))
+        self.assertEqual(srv.job_row(self.job_id)["status"], "claimed")
 
 
 class ClaimReapTest(unittest.TestCase):

@@ -102,8 +102,15 @@ def init_db() -> None:
             heartbeat_at TIMESTAMP
         );
         CREATE INDEX IF NOT EXISTS idx_jobs_status ON inference_jobs (status, created_at);
-        CREATE INDEX IF NOT EXISTS idx_jobs_heartbeat ON inference_jobs (status, heartbeat_at);
     """)
+    # SQLite 的 CREATE TABLE IF NOT EXISTS 不会给已有部署补列；显式迁移旧库。
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(inference_jobs)")}
+    if "heartbeat_at" not in columns:
+        conn.execute("ALTER TABLE inference_jobs ADD COLUMN heartbeat_at TIMESTAMP")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_jobs_heartbeat "
+        "ON inference_jobs (status, heartbeat_at)"
+    )
     conn.commit()
     conn.close()
 
@@ -194,11 +201,11 @@ def update_status(job_id: str, status: str, **fields):
     conn.close()
 
 
-def transition(job_id: str, action: str, status: str, **fields) -> bool:
+def transition(job_id: str, run_token: str, action: str, status: str, **fields) -> bool:
     """带状态条件的原子状态转换，返回是否成功。
 
     action ∈ {"progress","result","fail"}，对应合法前置状态见 _VALID_TRANSITIONS。
-    只有当任务当前处于合法前置状态时才会更新，避免旧节点/重放把终态（done/failed）覆盖掉。
+    job_id 与 run_token 必须同时匹配，避免任务回收重派后旧节点更新新租约。
     """
     allowed = _VALID_TRANSITIONS.get(action)
     if not allowed:
@@ -208,13 +215,13 @@ def transition(job_id: str, action: str, status: str, **fields) -> bool:
     for k, v in fields.items():
         sets.append(f"{k} = ?")
         values.append(v)
-    values.extend([job_id, *allowed])
+    values.extend([job_id, run_token, *allowed])
     placeholders = ", ".join("?" for _ in allowed)
     conn = get_db()
     try:
         cur = conn.execute(
             f"UPDATE inference_jobs SET {', '.join(sets)} "
-            f"WHERE id = ? AND status IN ({placeholders})",
+            f"WHERE id = ? AND run_token = ? AND status IN ({placeholders})",
             values,
         )
         conn.commit()
@@ -223,14 +230,17 @@ def transition(job_id: str, action: str, status: str, **fields) -> bool:
         conn.close()
 
 
-def heartbeat(job_id: str) -> None:
+def heartbeat(job_id: str, run_token: str) -> bool:
     """刷新任务心跳时间戳（processing 阶段续期，防误回收）。"""
     conn = get_db()
-    conn.execute(
-        "UPDATE inference_jobs SET heartbeat_at=CURRENT_TIMESTAMP WHERE id = ?", (job_id,)
+    cur = conn.execute(
+        "UPDATE inference_jobs SET heartbeat_at=CURRENT_TIMESTAMP "
+        "WHERE id = ? AND run_token = ? AND status IN ('claimed','processing')",
+        (job_id, run_token),
     )
     conn.commit()
     conn.close()
+    return cur.rowcount > 0
 
 
 # ---------- 常量时间 token 比较 ----------
@@ -458,11 +468,12 @@ class Handler(BaseHTTPRequestHandler):
         if row is None:
             self._json(404, {"error": "任务不存在"})
             return
-        if not token_ok(self.headers.get("X-Inference-Run-Token", ""), row["run_token"] or ""):
+        run_token = self.headers.get("X-Inference-Run-Token", "")
+        if not token_ok(run_token, row["run_token"] or ""):
             self._json(403, {"error": "run_token 不匹配"})
             return
         data = Path(row["input_path"]).read_bytes()
-        heartbeat(job_id)  # 下载图纸即开始处理，续期防误回收
+        heartbeat(job_id, run_token)
         self._send(200, data, "application/octet-stream")
 
     # ---------------- 回传进度 ----------------
@@ -473,15 +484,17 @@ class Handler(BaseHTTPRequestHandler):
         if row is None:
             self._json(404, {"error": "任务不存在"})
             return
-        if not token_ok(self.headers.get("X-Inference-Run-Token", ""), row["run_token"] or ""):
+        run_token = self.headers.get("X-Inference-Run-Token", "")
+        if not token_ok(run_token, row["run_token"] or ""):
             self._json(403, {"error": "run_token 不匹配"})
             return
         # 进度回传即心跳续期；状态转换：claimed→processing 或 processing→processing
-        if not transition(job_id, "progress", "processing"):
+        run_token = self.headers.get("X-Inference-Run-Token", "")
+        if not transition(job_id, run_token, "progress", "processing"):
             # 已处于 done/failed 终态，旧节点重放，忽略而非报错
             self._json(200, {"ok": True, "status": row["status"], "stale": True})
             return
-        heartbeat(job_id)
+        heartbeat(job_id, run_token)
         self._json(200, {"ok": True})
 
     # ---------------- 回传结果 ----------------
@@ -492,7 +505,8 @@ class Handler(BaseHTTPRequestHandler):
         if row is None:
             self._json(404, {"error": "任务不存在"})
             return
-        if not token_ok(self.headers.get("X-Inference-Run-Token", ""), row["run_token"] or ""):
+        run_token = self.headers.get("X-Inference-Run-Token", "")
+        if not token_ok(run_token, row["run_token"] or ""):
             self._json(403, {"error": "run_token 不匹配"})
             return
 
@@ -547,26 +561,19 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"error": "结果包不是合法 zip"})
             return
 
-        # 状态转换（claimed/processing → done）：终态后旧节点重放会被拒绝
-        if not transition(job_id, "result", "done", result_path=""):
-            self._json(200, {"ok": True, "status": row["status"], "stale": True})
-            return
-
-        # 写盘（临时文件 + 原子 rename），写入成功后再登记 result_path
-        result_path = STORAGE_DIR / "result" / f"{job_id}.zip"
+        # 先写入带 run_token 的唯一文件，成功后再以同一 token 提交 done 状态。
+        # 这样旧节点不会覆盖新租约的结果，也不会留下 done 但无文件的记录。
+        result_path = STORAGE_DIR / "result" / f"{job_id}.{run_token}.zip"
         tmp_path = result_path.with_suffix(".zip.part")
         try:
             tmp_path.write_bytes(body)
             tmp_path.replace(result_path)
         finally:
             tmp_path.unlink(missing_ok=True)
-        conn = get_db()
-        conn.execute(
-            "UPDATE inference_jobs SET result_path=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
-            (str(result_path), job_id),
-        )
-        conn.commit()
-        conn.close()
+        if not transition(job_id, run_token, "result", "done", result_path=str(result_path)):
+            result_path.unlink(missing_ok=True)
+            self._json(200, {"ok": True, "status": row["status"], "stale": True})
+            return
         self._json(200, {"ok": True, "status": "done"})
 
     # ---------------- 失败回退 ----------------
@@ -585,7 +592,8 @@ class Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             payload = {}
         # 状态转换（claimed/processing → failed）：终态后旧节点重放被忽略
-        if not transition(job_id, "fail", "failed", error=str(payload.get("error") or "")[-1000:]):
+        run_token = self.headers.get("X-Inference-Run-Token", "")
+        if not transition(job_id, run_token, "fail", "failed", error=str(payload.get("error") or "")[-1000:]):
             self._json(200, {"ok": True, "status": row["status"], "stale": True})
             return
         # TODO: 在这里接入云端回退 Worker
@@ -708,7 +716,7 @@ def main():
     threading.Thread(target=_cleanup_loop, daemon=True).start()
 
     server = ThreadingHTTPServer((HOST, PORT), Handler)
-    # 并发上限：限制同时处理的请求，防公网慢请求拖垮服务
+    # 请求线程随主进程退出，避免关闭时残留后台线程；公网并发限制由反向代理负责。
     server.daemon_threads = True
     print(f"PhysMeta inference server listening on {HOST}:{PORT}")
     try:
