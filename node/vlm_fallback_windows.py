@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 import threading
 from pathlib import Path
 from typing import Any
@@ -203,7 +204,12 @@ def read_all(
     out: list[dict[str, Any]] = []
     for b in boxes:
         item = dict(b)
-        item["vlm_candidate"] = read_box(image, item, model_path, adapter_path)
+        try:
+            item["vlm_candidate"] = read_box(image, item, model_path, adapter_path)
+        except Exception as exc:  # 单框失败不拖垮整单：跳过并标 needs_review
+            print(f"[vlm] 单框读取失败，跳过：{exc}", file=sys.stderr, flush=True)
+            item["vlm_candidate"] = None
+            item["vlm_failed"] = True
         item["ocr_text"] = ""
         item["ocr_conf"] = 0.0
         out.append(item)

@@ -617,6 +617,36 @@ def run_job(config: dict[str, Any], job: dict[str, Any], run_token: str) -> None
     shutil.rmtree(job_root, ignore_errors=True)
 
 
+# ---------- 模型预热 ----------
+
+def warmup(config: dict[str, Any]) -> None:
+    """后台预热：加载 YOLO + VLM 到显存，消除首单冷启动（实测 ~48s）。
+
+    预热失败不阻塞启动（首单会再尝试加载），只记录日志。
+    """
+    try:
+        sys.path.insert(0, str(config["bubble_src"]))
+        from bubble_ocr import config as bubble_config  # noqa
+        from bubble_ocr import detect as detect_mod  # noqa
+        from bubble_ocr import vlm_fallback_windows as vlm_mod  # noqa
+
+        weights = Path(str(config.get("weights") or os.getenv("BUBBLE_YOLO_WEIGHTS") or bubble_config.YOLO_WEIGHTS))
+        model_dir = config.get("vlm_model") or os.getenv("BUBBLE_VLM_MODEL") or bubble_config.VLM_MODEL_DIR
+        adapter_dir = config.get("vlm_adapter") or os.getenv("BUBBLE_VLM_ADAPTER") or bubble_config.VLM_ADAPTER_DIR
+
+        model_path = Path(str(model_dir)) if model_dir else None
+        adapter_path = Path(str(adapter_dir)) if adapter_dir else None
+        if model_path is not None and not model_path.exists():
+            model_path = None
+
+        detect_mod._get_model(weights)  # 加载 YOLO
+        if model_path is not None:
+            vlm_mod._load(model_path, adapter_path)  # 加载 VLM 基座 + merge adapter
+        _log("[节点] 模型预热完成（YOLO + VLM 已就绪）")
+    except Exception as exc:  # noqa: BLE001
+        _log(f"[节点] 模型预热失败（不影响运行，首单会再尝试加载）：{exc}")
+
+
 # ---------- 主循环 ----------
 
 def run_loop(config: dict[str, Any], once: bool) -> int:
@@ -629,6 +659,8 @@ def run_loop(config: dict[str, Any], once: bool) -> int:
         link={"status": "ok", "failures": 0, "last_error": ""},
     )
     _log(f"[节点] 已启动：{config['node_id']}（{AGENT_VERSION}），服务 {config['server']}")
+    # 后台预热模型，消除首单冷启动
+    threading.Thread(target=warmup, args=(config,), daemon=True).start()
 
     while True:
         try:
@@ -647,7 +679,7 @@ def run_loop(config: dict[str, Any], once: bool) -> int:
             _set_state(state="idle", link={"status": "ok", "failures": 0, "last_error": ""})
         except AgentAuthenticationError:
             raise
-        except AgentError as exc:
+        except Exception as exc:
             connection_failures += 1
             delay = min(8.0, float(2 ** min(3, max(1, connection_failures))))
             _set_state(
@@ -706,7 +738,7 @@ def run_loop(config: dict[str, Any], once: bool) -> int:
             _log(f"[节点] 任务 {job_id} 完成（{elapsed:.1f}s）")
         except AgentAuthenticationError:
             raise
-        except AgentError as exc:
+        except Exception as exc:
             elapsed = time.time() - started
             error = str(exc)[-1000:]
             _push_recent({
@@ -728,7 +760,9 @@ def run_loop(config: dict[str, Any], once: bool) -> int:
                     run_token=run_token,
                     timeout=10.0,
                 )
-            except AgentError:
+            except AgentAuthenticationError:
+                raise
+            except Exception:
                 pass
             if once:
                 raise
@@ -751,9 +785,17 @@ def main() -> int:
         return run_loop(config, args.once)
     except KeyboardInterrupt:
         return 0
+    except AgentAuthenticationError as exc:
+        _log(f"PhysMeta 推理节点认证失败（token 无效/失效）：{exc}")
+        return 1
     except AgentError as exc:
         _log(f"PhysMeta 推理节点错误：{exc}")
         return 1
+    except Exception as exc:  # 未预期崩溃：退出码 2，交给 start-node.bat 自动重启
+        import traceback
+        traceback.print_exc()
+        _log(f"PhysMeta 推理节点异常崩溃：{exc}")
+        return 2
 
 
 if __name__ == "__main__":
