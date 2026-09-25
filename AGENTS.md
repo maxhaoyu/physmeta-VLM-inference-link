@@ -35,7 +35,16 @@ Windows 本地推理链路（队列 + 节点）。线上路径 `yolobubble.physm
 
 ## 三、验收命令
 
-> TODO：clone 完成后按本仓库真实脚本补全。
+本仓库是「推理链路服务」，**无单元测试**，验收方式是**部署后接口健康检查**（见 `DEPLOY.md` 第 3.6 / 4 节）：
+
+```sh
+# 服务部署后，验证队列与节点接口
+curl -f http://127.0.0.1:18090/healthz                     # 期望 {"status":"ok"}
+curl -i -X POST http://127.0.0.1:18090/api/inference/claim -d '{}'   # 期望 401（未带节点 token）
+curl -f https://yolobubble.physmeta.cn/api/inference/healthz        # 公网健康检查
+```
+
+完整部署步骤与验收标准见 `DEPLOY.md`（自包含部署指令）。
 
 ## 四、关联模块
 
