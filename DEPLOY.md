@@ -203,17 +203,18 @@ curl -f https://yolobubble.physmeta.cn/api/inference/healthz 2>/dev/null || \
 
 ## 6. Windows 节点端（客户本地，不在你的职责内，但附上以便你了解全貌）
 
-- 节点目录已就绪：`C:\PhysMetaInference-ocr\`（`agent.py` + `inference-node.json` + `vlm_fallback_windows.py`）。
+- 节点目录已就绪：`C:\PhysMetaInference-ocr\`（`agent.py` + `start-node.bat` + `inference-node.json` + `vlm_fallback_windows.py`）。
 - `inference-node.json` 里 `server=https://yolobubble.physmeta.cn`、`node_id=windows-5060ti-01`、
   `use_ocr=false`，`token` 待填（就是上面下发的 NODE_TOKEN）。
 - **VLM 模型版本**：基座 = `models/vlm/MiniCPM-V-4.6-hf-ra600`（已 merge checkpoint-600），
   adapter = `models/adapters/checkpoint-150-best`。**不能挂原始 `MiniCPM-V-4.6-hf`**，详见 `docs/MODEL_VERSION.md`。
-- 用户填完 token 后，在 Windows 上运行一个常驻进程：
+- 用户填完 token 后，在 Windows 上**双击 `start-node.bat`** 即可（推荐，含模型预热 + 崩溃自动重启）：
+  该脚本长轮询 `POST /api/inference/claim` 领单 → 下载图纸 → 本地 GPU 跑 YOLO+VLM → 回传 result.zip。
+  等价的手动命令（调试用）：
   ```
   C:\Users\maxzh\WorkBuddy\2026-09-23-16-10-09\bubble-ocr-app\.venv\Scripts\python.exe ^
     C:\PhysMetaInference-ocr\agent.py --config C:\PhysMetaInference-ocr\inference-node.json
   ```
-  该进程长轮询 `POST /api/inference/claim` 领单 → 下载图纸 → 本地 GPU 跑 YOLO+VLM → 回传 result.zip。
 
 ## 7. 红线（务必遵守）
 
