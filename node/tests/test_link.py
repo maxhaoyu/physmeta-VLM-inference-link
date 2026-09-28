@@ -45,7 +45,7 @@ class LinkTest(unittest.TestCase):
         jid=self.srv.new_job_id();data=b'synthetic drawing';p=self.root/(jid+'.png');p.write_bytes(data)
         c=self.srv.get_db();c.execute('INSERT INTO inference_jobs(id,input_path,input_sha256,input_bytes,filename,options) VALUES(?,?,?,?,?,?)',
             (jid,str(p),hashlib.sha256(data).hexdigest(),len(data),'synthetic.png','{}'));c.commit();c.close()
-        result=agent.request_json(self.config,'POST','/api/inference/claim',{'wait_seconds':0})
+        result=agent.request_json(self.config,'POST','/api/inference/claim',{'wait_seconds':0,'heartbeat':True})
         return result['job'],result['run_token']
 
     def artifact(self, name='result.zip', payload=None):
@@ -59,7 +59,7 @@ class LinkTest(unittest.TestCase):
         def slow(*_):
             deadline=time.monotonic()+3.2
             while time.monotonic()<deadline:
-                other=agent.request_json({**self.config,'node_id':'second'},'POST','/api/inference/claim',{'wait_seconds':0})
+                other=agent.request_json({**self.config,'node_id':'second'},'POST','/api/inference/claim',{'wait_seconds':0,'heartbeat':True})
                 self.assertNotIn('job',other)
                 time.sleep(.15)
             return {'boxes':[]}
@@ -117,8 +117,28 @@ class LinkTest(unittest.TestCase):
     def test_missing_heartbeat_reclaims_crashed_worker(self):
         job,token=self.job();c=self.srv.get_db()
         c.execute("UPDATE inference_jobs SET status='processing', heartbeat_at=datetime('now','-7200 seconds') WHERE id=?",(job['id'],));c.commit();c.close()
-        next_claim=agent.request_json(self.config,'POST','/api/inference/claim',{'wait_seconds':0})
+        next_claim=agent.request_json(self.config,'POST','/api/inference/claim',{'wait_seconds':0,'heartbeat':True})
         self.assertEqual(next_claim['job']['id'],job['id']);self.assertNotEqual(next_claim['run_token'],token)
+
+    def test_legacy_worker_is_not_reaped_and_can_finish_in_compat_mode(self):
+        job, token = self.job()
+        c=self.srv.get_db()
+        c.execute("UPDATE inference_jobs SET lease_managed=0,updated_at=datetime('now','-7200 seconds'),heartbeat_at=datetime('now','-7200 seconds')")
+        c.commit();c.close()
+        other=agent.request_json(self.config,'POST','/api/inference/claim',{'wait_seconds':0,'heartbeat':True})
+        self.assertNotIn('job',other)
+        self.srv.LEGACY_NODE_COMPAT=True
+        req=agent.urllib.request.Request(self.config['server']+'/api/inference/jobs/'+job['id']+'/result',
+            data=self.artifact().read_bytes(),headers={'Authorization':'Bearer '+'n'*64,
+            'X-Inference-Run-Token':token,'Content-Type':'application/zip'})
+        with self.original_urlopen(req,10) as response:self.assertTrue(json.load(response)['ok'])
+        # Strict verification remains mandatory for the updated workers.
+        newjob,newtoken=self.job()
+        req=agent.urllib.request.Request(self.config['server']+'/api/inference/jobs/'+newjob['id']+'/result',
+            data=self.artifact().read_bytes(),headers={'Authorization':'Bearer '+'n'*64,
+            'X-Inference-Run-Token':newtoken,'Content-Type':'application/zip'})
+        with self.assertRaises(urllib.error.HTTPError) as error:self.original_urlopen(req,10)
+        self.assertEqual(error.exception.code,400)
 
     def test_retention_zero_preserves_old_results(self):
         job,token=self.job();agent.upload_result(self.config,job['id'],token,self.artifact())

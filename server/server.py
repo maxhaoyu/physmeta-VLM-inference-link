@@ -36,6 +36,7 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs, quote
 
 # ---------- 配置 ----------
+SERVER_VERSION = "queue-1.1.0"
 ROOT = Path(__file__).resolve().parent
 DB_PATH = Path(os.environ.get("INFERENCE_DB", str(ROOT / "inference.db")))
 STORAGE_DIR = Path(os.environ.get("INFERENCE_STORAGE", str(ROOT / "storage")))
@@ -48,6 +49,7 @@ MAX_UPLOAD_BYTES = int(os.environ.get("INFERENCE_MAX_UPLOAD", str(50 * 1024 * 10
 # 结果回传大小上限（结果 zip 正常 1~10MB，设上限防持 token 者撑爆磁盘）
 MAX_RESULT_BYTES = int(os.environ.get("INFERENCE_MAX_RESULT", str(50 * 1024 * 1024)))
 # claimed 任务超时回收：节点崩溃后，超过该时长的 claimed 任务重置为 pending 重新派发
+LEGACY_NODE_COMPAT = os.environ.get("INFERENCE_LEGACY_NODE_COMPAT", "0") == "1"
 CLAIM_TIMEOUT_SECONDS = int(os.environ.get("INFERENCE_CLAIM_TIMEOUT", "300"))
 # processing 任务超时回收：节点回传进度后崩溃，超过该时长未完成则重置为 pending（需要租约心跳续期）
 PROCESSING_TIMEOUT_SECONDS = int(os.environ.get("INFERENCE_PROCESSING_TIMEOUT", "3600"))
@@ -107,6 +109,9 @@ def init_db() -> None:
     columns = {row[1] for row in conn.execute("PRAGMA table_info(inference_jobs)")}
     if "heartbeat_at" not in columns:
         conn.execute("ALTER TABLE inference_jobs ADD COLUMN heartbeat_at TIMESTAMP")
+    if "lease_managed" not in columns:
+        # Existing rows and legacy Windows workers must not be reaped as heartbeat workers.
+        conn.execute("ALTER TABLE inference_jobs ADD COLUMN lease_managed INTEGER NOT NULL DEFAULT 0")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_jobs_heartbeat "
         "ON inference_jobs (status, heartbeat_at)"
@@ -140,12 +145,12 @@ def _reap_stale_claimed(conn: sqlite3.Connection) -> None:
     """
     conn.execute(
         "UPDATE inference_jobs SET status='pending', node_id=NULL, run_token=NULL, heartbeat_at=NULL "
-        "WHERE status='claimed' AND updated_at < datetime('now', ?)",
+        "WHERE lease_managed=1 AND status='claimed' AND updated_at < datetime('now', ?)",
         (f"-{CLAIM_TIMEOUT_SECONDS} seconds",),
     )
     conn.execute(
         "UPDATE inference_jobs SET status='pending', node_id=NULL, run_token=NULL, heartbeat_at=NULL "
-        "WHERE status='processing' AND COALESCE(heartbeat_at, updated_at) < datetime('now', ?)",
+        "WHERE lease_managed=1 AND status='processing' AND COALESCE(heartbeat_at, updated_at) < datetime('now', ?)",
         (f"-{PROCESSING_TIMEOUT_SECONDS} seconds",),
     )
 
@@ -158,7 +163,7 @@ _VALID_TRANSITIONS = {
 }
 
 
-def claim_next_pending(node_id: str, run_token: str):
+def claim_next_pending(node_id: str, run_token: str, lease_managed: bool = False):
     """原子领取队首 pending 任务，返回任务行或 None。
 
     用 BEGIN IMMEDIATE 加写锁，保证「查 pending + 标记 claimed」原子，
@@ -175,9 +180,9 @@ def claim_next_pending(node_id: str, run_token: str):
             conn.rollback()
             return None
         conn.execute(
-            "UPDATE inference_jobs SET status='claimed', node_id=?, run_token=?, "
+            "UPDATE inference_jobs SET status='claimed', node_id=?, run_token=?, lease_managed=?, "
             "updated_at=CURRENT_TIMESTAMP, heartbeat_at=CURRENT_TIMESTAMP WHERE id=? AND status='pending'",
-            (node_id, run_token, row["id"]),
+            (node_id, run_token, int(lease_managed), row["id"]),
         )
         conn.commit()
         return dict(row)
@@ -190,8 +195,6 @@ def claim_next_pending(node_id: str, run_token: str):
 
 def update_status(job_id: str, status: str, **fields):
     sets = ["status = ?", "updated_at = CURRENT_TIMESTAMP"]
-    if action == "progress":
-        sets.append("heartbeat_at = CURRENT_TIMESTAMP")
     values = [status]
     for k, v in fields.items():
         sets.append(f"{k} = ?")
@@ -301,7 +304,7 @@ class Handler(BaseHTTPRequestHandler):
         p = parsed.path
 
         if p == "/healthz":
-            self._json(200, {"status": "ok"})
+            self._json(200, {"status": "ok", "version": SERVER_VERSION})
             return
 
         m = re.fullmatch(r"/api/inference/jobs/([^/]+)/input", p)
@@ -451,7 +454,7 @@ class Handler(BaseHTTPRequestHandler):
         node_id = self.headers.get("X-Inference-Node-ID", "")
         while True:
             run_token = secrets.token_hex(32)
-            row = claim_next_pending(node_id, run_token)
+            row = claim_next_pending(node_id, run_token, payload.get("heartbeat") is True)
             if row is not None:
                 self._json(200, {
                     "job": {
@@ -545,10 +548,10 @@ class Handler(BaseHTTPRequestHandler):
         # 强制 SHA-256 校验：生产环境必须携带且匹配，缺失或错误一律拒绝
         digest = sha256(body)
         expected = self.headers.get("X-Artifact-SHA256", "")
-        if not expected:
+        if not expected and (row["lease_managed"] or not LEGACY_NODE_COMPAT):
             self._json(400, {"error": "缺少 X-Artifact-SHA256 头"})
             return
-        if digest != expected:
+        if expected and digest != expected:
             self._json(400, {"error": "结果 SHA-256 校验失败"})
             return
 

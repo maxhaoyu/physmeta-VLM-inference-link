@@ -199,7 +199,12 @@ def fallback(
     for b in boxes:
         item = dict(b)
         if item.get("ocr_conf", 0.0) < threshold:
-            item["vlm_candidate"] = read_box(image, item, model_path, adapter_path)
+            try:
+                item["vlm_candidate"] = read_box(image, item, model_path, adapter_path)
+            except Exception as exc:
+                print(f"[vlm] 单框读取失败，转人工复核：{exc}", file=sys.stderr, flush=True)
+                item["vlm_candidate"] = None
+                item["vlm_failed"] = True
         else:
             item["vlm_candidate"] = None
         out.append(item)

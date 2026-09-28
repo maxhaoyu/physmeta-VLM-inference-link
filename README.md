@@ -1,3 +1,7 @@
+# 当前升级入口
+
+2026-09-28 配套升级、Windows BAT 与兼容配置请先读 [升级说明](docs/UPGRADE-20260928.md)。
+
 # PhysMeta 最小化推理链路（单节点 · Windows 整链路推理 · 含 VLM）
 
 > 基于老方案（`06_BAT工具/01_PDF_Inference_Node`）的代码级复用 + 大幅精简。

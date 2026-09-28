@@ -109,8 +109,8 @@ class ClaimReapTest(unittest.TestCase):
         jid = srv.new_job_id()
         conn = srv.get_db()
         conn.execute(
-            "INSERT INTO inference_jobs (id, input_path, input_sha256, input_bytes, status, updated_at, heartbeat_at) "
-            "VALUES (?, ?, ?, ?, ?, datetime('now', ?), datetime('now', ?))",
+            "INSERT INTO inference_jobs (id, input_path, input_sha256, input_bytes, status, updated_at, heartbeat_at, lease_managed) "
+            "VALUES (?, ?, ?, ?, ?, datetime('now', ?), datetime('now', ?), 1)",
             (jid, "/tmp/x", "a" * 64, 1, status, f"-{updated_offset_seconds} seconds",
              f"-{updated_offset_seconds} seconds"),
         )

@@ -295,7 +295,7 @@ def _start_monitor(port: int, *, open_browser: bool) -> None:
 
 def load_config(path: Path) -> dict[str, Any]:
     try:
-        config = json.loads(path.read_text(encoding="utf-8"))
+        config = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError) as exc:
         raise AgentError(f"配置文件无效：{exc}") from exc
     if not isinstance(config, dict):
@@ -735,7 +735,7 @@ def run_job(config: dict[str, Any], job: dict[str, Any], run_token: str) -> None
 # ---------- 模型预热 ----------
 
 def warmup(config: dict[str, Any]) -> None:
-    """后台预热：加载 YOLO + VLM 到显存，消除首单冷启动（实测 ~48s）。
+    """领单前预热：加载 YOLO + VLM 到显存，避免首单并发重复加载。
 
     预热失败不阻塞启动（首单会再尝试加载），只记录日志。
     """
@@ -774,8 +774,9 @@ def run_loop(config: dict[str, Any], once: bool) -> int:
         link={"status": "ok", "failures": 0, "last_error": ""},
     )
     _log(f"[节点] 已启动：{config['node_id']}（{AGENT_VERSION}），服务 {config['server']}")
-    # 后台预热模型，消除首单冷启动
-    threading.Thread(target=warmup, args=(config,), daemon=True).start()
+    # Finish warmup before claiming: YOLO's cache is not thread-safe and a
+    # background warmup can race the first task, doubling model allocation.
+    warmup(config)
 
     while True:
         try:
@@ -785,7 +786,7 @@ def run_loop(config: dict[str, Any], once: bool) -> int:
                 config,
                 "POST",
                 "/api/inference/claim",
-                {"wait_seconds": long_poll},
+                {"wait_seconds": long_poll, "heartbeat": True},
                 timeout=max(10.0, long_poll + 5.0),
             )
             if connection_failures:

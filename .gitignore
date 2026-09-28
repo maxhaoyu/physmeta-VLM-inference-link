@@ -26,3 +26,4 @@ adapters/
 .env
 .DS_Store
 *.log
+node/status.json
