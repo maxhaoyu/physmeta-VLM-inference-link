@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -35,7 +36,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlparse
 
-AGENT_VERSION = "minimal-1.0.0"
+AGENT_VERSION = "minimal-1.1.0"
 JOB_ID_PATTERN = re.compile(r"cad-\d{8}-\d{6}-[A-Za-z0-9]{6}\Z")
 
 
@@ -45,6 +46,14 @@ class AgentError(RuntimeError):
 
 class AgentAuthenticationError(AgentError):
     pass
+
+
+class AgentRetryableError(AgentError):
+    """A transport/server failure that can be retried without re-running inference."""
+
+
+class AgentLeaseLost(AgentError):
+    """The job was reassigned or finished; this worker must stop publishing."""
 
 
 # ---------- 本地监控面板（只绑定 127.0.0.1，不对外暴露） ----------
@@ -372,11 +381,77 @@ def request_json(
         except (UnicodeDecodeError, json.JSONDecodeError):
             error_payload = {}
         message = str(error_payload.get("error") or f"HTTP {exc.code}")
-        if exc.code in {401, 403}:
+        if exc.code == 401 or (exc.code == 403 and not run_token):
             raise AgentAuthenticationError(message) from exc
+        if exc.code in {403, 404, 409} and run_token:
+            raise AgentLeaseLost(message) from exc
+        if exc.code >= 500 or exc.code in {408, 429}:
+            raise AgentRetryableError(message) from exc
         raise AgentError(message) from exc
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise AgentError(f"远程服务暂时不可用：{exc}") from exc
+    except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as exc:
+        raise AgentRetryableError(f"远程服务暂时不可用：{exc}") from exc
+
+
+def retry_network(config, action, lease=None):
+    deadline = time.monotonic() + float(config.get("network_retry_seconds", 300))
+    delay = max(0.05, min(10.0, float(config.get("retry_interval_seconds", 2))))
+    while True:
+        if lease is not None:
+            lease.check()
+        try:
+            return action()
+        except AgentRetryableError:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            time.sleep(min(delay, remaining))
+
+
+class JobHeartbeat:
+    """Renew the processing lease during download, GPU inference and result upload."""
+    def __init__(self, config, job_id, run_token):
+        self.config, self.job_id, self.run_token = config, job_id, run_token
+        self.stop = threading.Event()
+        self.failure = None
+        self.thread = None
+        self.interval = max(0.05, min(30.0, float(config.get("heartbeat_seconds", 15))))
+
+    def pulse(self):
+        response = request_json(self.config, "POST",
+            f"/api/inference/jobs/{quote(self.job_id)}/progress", {},
+            run_token=self.run_token, timeout=10)
+        if response.get("stale"):
+            raise AgentLeaseLost("任务租约已失效，保留本地结果，停止回传")
+
+    def check(self):
+        if self.failure is not None:
+            raise self.failure
+
+    def _loop(self):
+        disconnected = False
+        while not self.stop.wait(self.interval):
+            try:
+                self.pulse()
+                if disconnected:
+                    _log("[节点] 任务心跳已恢复")
+                disconnected = False
+            except AgentRetryableError:
+                if not disconnected:
+                    _log("[节点] 任务心跳暂时中断，正在重连")
+                disconnected = True
+            except AgentError as exc:
+                self.failure = exc
+                return
+
+    def __enter__(self):
+        retry_network(self.config, self.pulse)
+        self.thread = threading.Thread(target=self._loop, daemon=True, name="job-heartbeat")
+        self.thread.start()
+        return self
+
+    def __exit__(self, *_):
+        self.stop.set()
+        self.thread.join(timeout=12)
 
 
 # ---------- 文件工具 ----------
@@ -451,9 +526,15 @@ def download_input(config: dict[str, Any], job: dict[str, Any], run_token: str, 
         with _urlopen(request, 180) as response, partial.open("wb") as output:
             shutil.copyfileobj(response, output, length=1024 * 1024)
     except urllib.error.HTTPError as exc:
-        if exc.code in {401, 403}:
+        if exc.code == 401:
             raise AgentAuthenticationError("下载任务输入时身份失效") from exc
+        if exc.code in {403, 404, 409}:
+            raise AgentLeaseLost("下载任务输入时租约失效") from exc
+        if exc.code >= 500 or exc.code in {408, 429}:
+            raise AgentRetryableError(f"下载任务输入暂不可用：HTTP {exc.code}") from exc
         raise AgentError(f"下载任务输入失败：HTTP {exc.code}") from exc
+    except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as exc:
+        raise AgentRetryableError("下载中断，将重新下载并校验") from exc
 
     if partial.stat().st_size != int(job["input_bytes"]):
         partial.unlink(missing_ok=True)
@@ -507,13 +588,24 @@ def upload_result(config: dict[str, Any], job_id: str, run_token: str, archive_p
     try:
         with _urlopen(request, 300) as response:
             payload = json.loads(response.read().decode("utf-8"))
-            return payload if isinstance(payload, dict) else {}
+            if not isinstance(payload, dict) or not payload.get("ok") or payload.get("stale"):
+                raise AgentLeaseLost("结果未被服务器接受，保留本地文件")
+            return payload
     except urllib.error.HTTPError as exc:
         try:
             payload = json.loads(exc.read().decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
             payload = {}
-        raise AgentError(str(payload.get("error") or f"结果上传失败：HTTP {exc.code}")) from exc
+        message = str(payload.get("error") or f"结果上传失败：HTTP {exc.code}")
+        if exc.code == 401:
+            raise AgentAuthenticationError(message) from exc
+        if exc.code in {403, 404, 409}:
+            raise AgentLeaseLost(message) from exc
+        if exc.code >= 500 or exc.code in {408, 429}:
+            raise AgentRetryableError(message) from exc
+        raise AgentError(message) from exc
+    except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as exc:
+        raise AgentRetryableError("结果回传中断，将重试同一结果包") from exc
 
 
 # ---------- 推理：调 bubble-ocr 完整链路 ----------
@@ -624,18 +716,17 @@ def run_job(config: dict[str, Any], job: dict[str, Any], run_token: str) -> None
 
     atomic_write_json(manifest_path, job)
 
-    # 1. 下载图纸
-    if not source.is_file() or sha256_file(source) != str(job["input_sha256"]):
-        download_input(config, job, run_token, source)
-
-    # 2. 本地推理（bubble-ocr 全链路）
-    options = job.get("options") or {}
-    payload = run_inference(config, source, options)
-    atomic_write_json(result_path, payload)
-
-    # 3. 打包 + 回传
-    archive_path = build_result_archive(job_root, result_path)
-    upload_result(config, job_id, run_token, archive_path)
+    with JobHeartbeat(config, job_id, run_token) as lease:
+        # Heartbeat starts before downloading/loading a model, not just after inference.
+        if not source.is_file() or sha256_file(source) != str(job["input_sha256"]):
+            retry_network(config, lambda: download_input(config, job, run_token, source), lease)
+        lease.check()
+        options = job.get("options") or {}
+        payload = run_inference(config, source, options)
+        atomic_write_json(result_path, payload)
+        lease.check()
+        archive_path = build_result_archive(job_root, result_path)
+        retry_network(config, lambda: upload_result(config, job_id, run_token, archive_path), lease)
 
     # 4. 清理本地任务目录
     shutil.rmtree(job_root, ignore_errors=True)
@@ -760,6 +851,12 @@ def run_loop(config: dict[str, Any], once: bool) -> int:
             _bump("succeeded")
             _set_state(state="idle", current_job=None)
             _log(f"[节点] 任务 {job_id} 完成（{elapsed:.1f}s）")
+        except AgentLeaseLost as exc:
+            _bump("failed")
+            _set_state(state="idle", current_job=None)
+            _log(f"[节点] {job_id} 租约已失效：{exc}；本地文件已保留")
+            if once:
+                raise
         except AgentAuthenticationError:
             # 身份失效（token 被吊销/改错）：必须停止，交给人工排查，不能静默吞掉
             raise

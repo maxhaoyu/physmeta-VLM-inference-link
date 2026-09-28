@@ -190,6 +190,8 @@ def claim_next_pending(node_id: str, run_token: str):
 
 def update_status(job_id: str, status: str, **fields):
     sets = ["status = ?", "updated_at = CURRENT_TIMESTAMP"]
+    if action == "progress":
+        sets.append("heartbeat_at = CURRENT_TIMESTAMP")
     values = [status]
     for k, v in fields.items():
         sets.append(f"{k} = ?")
@@ -211,6 +213,8 @@ def transition(job_id: str, run_token: str, action: str, status: str, **fields) 
     if not allowed:
         raise ValueError(f"未知状态转换动作：{action}")
     sets = ["status = ?", "updated_at = CURRENT_TIMESTAMP"]
+    if action == "progress":
+        sets.append("heartbeat_at = CURRENT_TIMESTAMP")
     values = [status]
     for k, v in fields.items():
         sets.append(f"{k} = ?")
@@ -498,7 +502,6 @@ class Handler(BaseHTTPRequestHandler):
             # 已处于 done/failed 终态，旧节点重放，忽略而非报错
             self._json(200, {"ok": True, "status": row["status"], "stale": True})
             return
-        heartbeat(job_id, run_token)
         self._json(200, {"ok": True})
 
     # ---------------- 回传结果 ----------------
@@ -576,7 +579,16 @@ class Handler(BaseHTTPRequestHandler):
             tmp_path.unlink(missing_ok=True)
         if not transition(job_id, run_token, "result", "done", result_path=str(result_path)):
             result_path.unlink(missing_ok=True)
-            self._json(200, {"ok": True, "status": row["status"], "stale": True})
+            current = job_row(job_id)
+            # A successful response may have been lost. Accept only byte-identical
+            # retries for the same lease; never replace an already committed result.
+            if (current is not None and current["status"] == "done"
+                    and token_ok(run_token, current["run_token"] or "")
+                    and current["result_path"] and Path(current["result_path"]).is_file()
+                    and sha256(Path(current["result_path"]).read_bytes()) == digest):
+                self._json(200, {"ok": True, "status": "done", "duplicate": True})
+                return
+            self._json(409, {"error": "任务已结束或租约已失效", "stale": True})
             return
         self._json(200, {"ok": True, "status": "done"})
 
@@ -663,6 +675,8 @@ def _cleanup_expired() -> int:
     只清理终态（done/failed）且超过 RETENTION_SECONDS 的任务；
     pending/claimed/processing 永不清理（仍在流转中）。
     """
+    if RETENTION_SECONDS <= 0:
+        return 0
     cutoff = time.time() - RETENTION_SECONDS
     conn = get_db()
     try:
