@@ -36,7 +36,7 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs, quote
 
 # ---------- 配置 ----------
-SERVER_VERSION = "queue-1.1.0"
+SERVER_VERSION = "queue-1.2.0"
 ROOT = Path(__file__).resolve().parent
 DB_PATH = Path(os.environ.get("INFERENCE_DB", str(ROOT / "inference.db")))
 STORAGE_DIR = Path(os.environ.get("INFERENCE_STORAGE", str(ROOT / "storage")))
@@ -53,6 +53,7 @@ LEGACY_NODE_COMPAT = os.environ.get("INFERENCE_LEGACY_NODE_COMPAT", "0") == "1"
 CLAIM_TIMEOUT_SECONDS = int(os.environ.get("INFERENCE_CLAIM_TIMEOUT", "300"))
 # processing 任务超时回收：节点回传进度后崩溃，超过该时长未完成则重置为 pending（需要租约心跳续期）
 PROCESSING_TIMEOUT_SECONDS = int(os.environ.get("INFERENCE_PROCESSING_TIMEOUT", "3600"))
+MAX_ATTEMPTS = max(1, int(os.environ.get("INFERENCE_MAX_ATTEMPTS", "3")))
 # 输入/结果文件保留期（秒）：超过该时长的文件与任务记录被清理，避免磁盘无限增长
 RETENTION_SECONDS = int(os.environ.get("INFERENCE_RETENTION", str(7 * 24 * 3600)))
 # 结果 zip 内允许的最大文件数与单文件最大解压后大小（防 zip 炸弹）
@@ -101,9 +102,33 @@ def init_db() -> None:
             error        TEXT,
             created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            heartbeat_at TIMESTAMP
+            heartbeat_at TIMESTAMP,
+            lease_managed INTEGER NOT NULL DEFAULT 0,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            max_attempts INTEGER NOT NULL DEFAULT 3,
+            agent_version TEXT,
+            protocol_version INTEGER,
+            last_phase TEXT,
+            last_progress REAL
         );
         CREATE INDEX IF NOT EXISTS idx_jobs_status ON inference_jobs (status, created_at);
+        CREATE TABLE IF NOT EXISTS inference_nodes (
+            node_id TEXT PRIMARY KEY,
+            agent_version TEXT,
+            protocol_version INTEGER,
+            capabilities TEXT,
+            current_job TEXT,
+            last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS job_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            node_id TEXT,
+            details TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_job_events_job ON job_events (job_id, id);
     """)
     # SQLite 的 CREATE TABLE IF NOT EXISTS 不会给已有部署补列；显式迁移旧库。
     columns = {row[1] for row in conn.execute("PRAGMA table_info(inference_jobs)")}
@@ -112,6 +137,17 @@ def init_db() -> None:
     if "lease_managed" not in columns:
         # Existing rows and legacy Windows workers must not be reaped as heartbeat workers.
         conn.execute("ALTER TABLE inference_jobs ADD COLUMN lease_managed INTEGER NOT NULL DEFAULT 0")
+    migrations = {
+        "attempt_count": "INTEGER NOT NULL DEFAULT 0",
+        "max_attempts": f"INTEGER NOT NULL DEFAULT {MAX_ATTEMPTS}",
+        "agent_version": "TEXT",
+        "protocol_version": "INTEGER",
+        "last_phase": "TEXT",
+        "last_progress": "REAL",
+    }
+    for column, declaration in migrations.items():
+        if column not in columns:
+            conn.execute(f"ALTER TABLE inference_jobs ADD COLUMN {column} {declaration}")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_jobs_heartbeat "
         "ON inference_jobs (status, heartbeat_at)"
@@ -137,22 +173,82 @@ def next_pending_job():
     return row
 
 
+def _event(
+    conn: sqlite3.Connection,
+    job_id: str,
+    event_type: str,
+    *,
+    node_id: str | None = None,
+    details: dict | None = None,
+) -> None:
+    conn.execute(
+        "INSERT INTO job_events (job_id, event_type, node_id, details) VALUES (?, ?, ?, ?)",
+        (job_id, event_type, node_id, json.dumps(details or {}, ensure_ascii=False)),
+    )
+
+
+def _touch_node(
+    conn: sqlite3.Connection,
+    node_id: str,
+    *,
+    agent_version: str = "",
+    protocol_version: int = 0,
+    capabilities: list[str] | None = None,
+    current_job: str | None = None,
+) -> None:
+    if not node_id:
+        return
+    conn.execute(
+        "INSERT INTO inference_nodes "
+        "(node_id, agent_version, protocol_version, capabilities, current_job, last_seen) "
+        "VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP) "
+        "ON CONFLICT(node_id) DO UPDATE SET "
+        "agent_version=excluded.agent_version, protocol_version=excluded.protocol_version, "
+        "capabilities=excluded.capabilities, last_seen=CURRENT_TIMESTAMP",
+        (
+            node_id,
+            agent_version[:80],
+            protocol_version,
+            json.dumps(capabilities or [], ensure_ascii=True),
+            current_job,
+        ),
+    )
+
+
 def _reap_stale_claimed(conn: sqlite3.Connection) -> None:
     """把超时未完成的 claimed / processing 任务重置为 pending（节点崩溃兜底，避免任务永久卡死）。
 
     - claimed：认领后超过 CLAIM_TIMEOUT_SECONDS 未开始（未回传进度）→ 重置。
     - processing：回传进度后超过 PROCESSING_TIMEOUT_SECONDS 未完成 → 重置（依赖心跳续期）。
     """
-    conn.execute(
-        "UPDATE inference_jobs SET status='pending', node_id=NULL, run_token=NULL, heartbeat_at=NULL "
-        "WHERE lease_managed=1 AND status='claimed' AND updated_at < datetime('now', ?)",
-        (f"-{CLAIM_TIMEOUT_SECONDS} seconds",),
-    )
-    conn.execute(
-        "UPDATE inference_jobs SET status='pending', node_id=NULL, run_token=NULL, heartbeat_at=NULL "
-        "WHERE lease_managed=1 AND status='processing' AND COALESCE(heartbeat_at, updated_at) < datetime('now', ?)",
-        (f"-{PROCESSING_TIMEOUT_SECONDS} seconds",),
-    )
+    stale = conn.execute(
+        "SELECT id, status, node_id, attempt_count, max_attempts FROM inference_jobs "
+        "WHERE lease_managed=1 AND "
+        "((status='claimed' AND updated_at < datetime('now', ?)) OR "
+        " (status='processing' AND COALESCE(heartbeat_at, updated_at) < datetime('now', ?)))",
+        (f"-{CLAIM_TIMEOUT_SECONDS} seconds", f"-{PROCESSING_TIMEOUT_SECONDS} seconds"),
+    ).fetchall()
+    for row in stale:
+        exhausted = int(row["attempt_count"] or 0) >= int(row["max_attempts"] or MAX_ATTEMPTS)
+        next_status = "dead_letter" if exhausted else "pending"
+        error = "租约超时且已达最大尝试次数" if exhausted else None
+        conn.execute(
+            "UPDATE inference_jobs SET status=?, node_id=NULL, run_token=NULL, heartbeat_at=NULL, "
+            "last_phase=?, last_progress=NULL, error=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (next_status, next_status, error, row["id"]),
+        )
+        _event(
+            conn,
+            row["id"],
+            "dead_letter" if exhausted else "lease_expired",
+            node_id=row["node_id"],
+            details={"previous_status": row["status"], "attempt_count": row["attempt_count"]},
+        )
+        if row["node_id"]:
+            conn.execute(
+                "UPDATE inference_nodes SET current_job=NULL WHERE node_id=? AND current_job=?",
+                (row["node_id"], row["id"]),
+            )
 
 
 # 合法状态转换表：确保 progress/result/fail 只能从合法前置状态转移，避免旧节点/重放覆盖终态
@@ -163,7 +259,15 @@ _VALID_TRANSITIONS = {
 }
 
 
-def claim_next_pending(node_id: str, run_token: str, lease_managed: bool = False):
+def claim_next_pending(
+    node_id: str,
+    run_token: str,
+    lease_managed: bool = False,
+    *,
+    agent_version: str = "",
+    protocol_version: int = 0,
+    capabilities: list[str] | None = None,
+):
     """原子领取队首 pending 任务，返回任务行或 None。
 
     用 BEGIN IMMEDIATE 加写锁，保证「查 pending + 标记 claimed」原子，
@@ -173,16 +277,41 @@ def claim_next_pending(node_id: str, run_token: str, lease_managed: bool = False
     try:
         conn.execute("BEGIN IMMEDIATE")
         _reap_stale_claimed(conn)
+        _touch_node(
+            conn,
+            node_id,
+            agent_version=agent_version,
+            protocol_version=protocol_version,
+            capabilities=capabilities,
+        )
         row = conn.execute(
             "SELECT * FROM inference_jobs WHERE status='pending' ORDER BY created_at ASC LIMIT 1"
         ).fetchone()
         if row is None:
-            conn.rollback()
+            conn.commit()
             return None
         conn.execute(
             "UPDATE inference_jobs SET status='claimed', node_id=?, run_token=?, lease_managed=?, "
+            "attempt_count=attempt_count+1, agent_version=?, protocol_version=?, "
+            "last_phase='claimed', last_progress=0, error=NULL, "
             "updated_at=CURRENT_TIMESTAMP, heartbeat_at=CURRENT_TIMESTAMP WHERE id=? AND status='pending'",
-            (node_id, run_token, int(lease_managed), row["id"]),
+            (node_id, run_token, int(lease_managed), agent_version[:80], protocol_version, row["id"]),
+        )
+        conn.execute(
+            "UPDATE inference_nodes SET current_job=?, last_seen=CURRENT_TIMESTAMP WHERE node_id=?",
+            (row["id"], node_id),
+        )
+        _event(
+            conn,
+            row["id"],
+            "claimed",
+            node_id=node_id,
+            details={
+                "lease_managed": bool(lease_managed),
+                "agent_version": agent_version[:80],
+                "protocol_version": protocol_version,
+                "attempt_count": int(row["attempt_count"] or 0) + 1,
+            },
         )
         conn.commit()
         return dict(row)
@@ -226,11 +355,27 @@ def transition(job_id: str, run_token: str, action: str, status: str, **fields) 
     placeholders = ", ".join("?" for _ in allowed)
     conn = get_db()
     try:
+        current = conn.execute(
+            "SELECT node_id FROM inference_jobs WHERE id=? AND run_token=?",
+            (job_id, run_token),
+        ).fetchone()
         cur = conn.execute(
             f"UPDATE inference_jobs SET {', '.join(sets)} "
             f"WHERE id = ? AND run_token = ? AND status IN ({placeholders})",
             values,
         )
+        if cur.rowcount > 0:
+            node_id = current["node_id"] if current else None
+            event_details = {"status": status}
+            for key in ("last_phase", "last_progress", "error"):
+                if key in fields and fields[key] is not None:
+                    event_details[key] = fields[key]
+            _event(conn, job_id, action, node_id=node_id, details=event_details)
+            if node_id:
+                conn.execute(
+                    "UPDATE inference_nodes SET current_job=?, last_seen=CURRENT_TIMESTAMP WHERE node_id=?",
+                    (None if status in {"done", "failed"} else job_id, node_id),
+                )
         conn.commit()
         return cur.rowcount > 0
     finally:
@@ -240,14 +385,48 @@ def transition(job_id: str, run_token: str, action: str, status: str, **fields) 
 def heartbeat(job_id: str, run_token: str) -> bool:
     """刷新任务心跳时间戳（processing 阶段续期，防误回收）。"""
     conn = get_db()
+    row = conn.execute(
+        "SELECT node_id FROM inference_jobs WHERE id=? AND run_token=?",
+        (job_id, run_token),
+    ).fetchone()
     cur = conn.execute(
         "UPDATE inference_jobs SET heartbeat_at=CURRENT_TIMESTAMP "
         "WHERE id = ? AND run_token = ? AND status IN ('claimed','processing')",
         (job_id, run_token),
     )
+    if cur.rowcount > 0 and row and row["node_id"]:
+        conn.execute(
+            "UPDATE inference_nodes SET current_job=?, last_seen=CURRENT_TIMESTAMP WHERE node_id=?",
+            (job_id, row["node_id"]),
+        )
     conn.commit()
     conn.close()
     return cur.rowcount > 0
+
+
+def health_summary() -> dict:
+    conn = get_db()
+    try:
+        counts = {
+            row["status"]: row["count"]
+            for row in conn.execute(
+                "SELECT status, COUNT(*) AS count FROM inference_jobs GROUP BY status"
+            )
+        }
+        stale_legacy = conn.execute(
+            "SELECT COUNT(*) FROM inference_jobs "
+            "WHERE lease_managed=0 AND status IN ('claimed','processing')"
+        ).fetchone()[0]
+        nodes = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT node_id, agent_version, protocol_version, current_job, last_seen "
+                "FROM inference_nodes ORDER BY node_id"
+            )
+        ]
+        return {"jobs": counts, "stale_legacy_jobs": stale_legacy, "nodes": nodes}
+    finally:
+        conn.close()
 
 
 # ---------- 常量时间 token 比较 ----------
@@ -304,7 +483,7 @@ class Handler(BaseHTTPRequestHandler):
         p = parsed.path
 
         if p == "/healthz":
-            self._json(200, {"status": "ok", "version": SERVER_VERSION})
+            self._json(200, {"status": "ok", "version": SERVER_VERSION, **health_summary()})
             return
 
         m = re.fullmatch(r"/api/inference/jobs/([^/]+)/input", p)
@@ -426,11 +605,13 @@ class Handler(BaseHTTPRequestHandler):
 
         conn = get_db()
         conn.execute(
-            "INSERT INTO inference_jobs (id, input_path, input_sha256, input_bytes, filename, options, status) "
-            "VALUES (?, ?, ?, ?, ?, ?, 'pending')",
+            "INSERT INTO inference_jobs "
+            "(id, input_path, input_sha256, input_bytes, filename, options, status, max_attempts) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)",
             (job_id, str(input_path), digest, len(image_bytes), filename,
-             json.dumps(options, ensure_ascii=False)),
+             json.dumps(options, ensure_ascii=False), MAX_ATTEMPTS),
         )
+        _event(conn, job_id, "uploaded", details={"input_bytes": len(image_bytes)})
         conn.commit()
         conn.close()
 
@@ -451,10 +632,29 @@ class Handler(BaseHTTPRequestHandler):
             wait_seconds = 5.0
 
         deadline = time.time() + wait_seconds
-        node_id = self.headers.get("X-Inference-Node-ID", "")
+        node_id = self.headers.get("X-Inference-Node-ID", "")[:120]
+        user_agent = self.headers.get("User-Agent", "")
+        agent_version = str(payload.get("agent_version") or "")[:80]
+        if not agent_version and user_agent.startswith("PhysMeta-Inference-Node/"):
+            agent_version = user_agent.removeprefix("PhysMeta-Inference-Node/")[:80]
+        try:
+            protocol_version = max(0, min(1000, int(payload.get("protocol_version") or 0)))
+        except (TypeError, ValueError):
+            protocol_version = 0
+        raw_capabilities = payload.get("capabilities")
+        capabilities = []
+        if isinstance(raw_capabilities, list):
+            capabilities = [str(item)[:80] for item in raw_capabilities[:20]]
         while True:
             run_token = secrets.token_hex(32)
-            row = claim_next_pending(node_id, run_token, payload.get("heartbeat") is True)
+            row = claim_next_pending(
+                node_id,
+                run_token,
+                payload.get("heartbeat") is True,
+                agent_version=agent_version,
+                protocol_version=protocol_version,
+                capabilities=capabilities,
+            )
             if row is not None:
                 self._json(200, {
                     "job": {
@@ -500,8 +700,27 @@ class Handler(BaseHTTPRequestHandler):
         if not token_ok(run_token, row["run_token"] or ""):
             self._json(403, {"error": "run_token 不匹配"})
             return
+        try:
+            payload = json.loads(self._read_body() or b"{}")
+        except json.JSONDecodeError:
+            payload = {}
+        phase = str(payload.get("phase") or "processing")[:80]
+        raw_progress = payload.get("progress")
+        progress = None
+        if raw_progress is not None:
+            try:
+                progress = max(0.0, min(1.0, float(raw_progress)))
+            except (TypeError, ValueError):
+                progress = None
         # 进度回传即心跳续期；状态转换：claimed→processing 或 processing→processing
-        if not transition(job_id, run_token, "progress", "processing"):
+        if not transition(
+            job_id,
+            run_token,
+            "progress",
+            "processing",
+            last_phase=phase,
+            last_progress=progress,
+        ):
             # 已处于 done/failed 终态，旧节点重放，忽略而非报错
             self._json(200, {"ok": True, "status": row["status"], "stale": True})
             return
@@ -580,7 +799,15 @@ class Handler(BaseHTTPRequestHandler):
             tmp_path.replace(result_path)
         finally:
             tmp_path.unlink(missing_ok=True)
-        if not transition(job_id, run_token, "result", "done", result_path=str(result_path)):
+        if not transition(
+            job_id,
+            run_token,
+            "result",
+            "done",
+            result_path=str(result_path),
+            last_phase="done",
+            last_progress=1.0,
+        ):
             result_path.unlink(missing_ok=True)
             current = job_row(job_id)
             # A successful response may have been lost. Accept only byte-identical
@@ -612,7 +839,14 @@ class Handler(BaseHTTPRequestHandler):
             payload = {}
         # 状态转换（claimed/processing → failed）：终态后旧节点重放被忽略
         run_token = self.headers.get("X-Inference-Run-Token", "")
-        if not transition(job_id, run_token, "fail", "failed", error=str(payload.get("error") or "")[-1000:]):
+        if not transition(
+            job_id,
+            run_token,
+            "fail",
+            "failed",
+            error=str(payload.get("error") or "")[-1000:],
+            last_phase="failed",
+        ):
             self._json(200, {"ok": True, "status": row["status"], "stale": True})
             return
         # TODO: 在这里接入云端回退 Worker
@@ -633,6 +867,10 @@ class Handler(BaseHTTPRequestHandler):
             "id": row["id"],
             "status": row["status"],
             "error": row["error"],
+            "attempt_count": row["attempt_count"],
+            "max_attempts": row["max_attempts"],
+            "last_phase": row["last_phase"],
+            "last_progress": row["last_progress"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         })

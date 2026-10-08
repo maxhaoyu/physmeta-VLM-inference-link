@@ -36,7 +36,9 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlparse
 
-AGENT_VERSION = "minimal-1.1.0"
+AGENT_VERSION = "minimal-1.2.0"
+PROTOCOL_VERSION = 2
+AGENT_CAPABILITIES = ["lease-heartbeat", "result-sha256", "phase-progress"]
 JOB_ID_PATTERN = re.compile(r"cad-\d{8}-\d{6}-[A-Za-z0-9]{6}\Z")
 
 
@@ -54,6 +56,59 @@ class AgentRetryableError(AgentError):
 
 class AgentLeaseLost(AgentError):
     """The job was reassigned or finished; this worker must stop publishing."""
+
+
+class SingleInstanceLock:
+    """OS-backed lock that is automatically released when the process exits."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.handle = None
+
+    def __enter__(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.handle = self.path.open("a+", encoding="ascii")
+        self.handle.seek(0)
+        if not self.handle.read(1):
+            self.handle.seek(0)
+            self.handle.write("0")
+            self.handle.flush()
+        self.handle.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(self.handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            self.handle.close()
+            self.handle = None
+            raise AgentError("同一 node_id 的推理节点已在运行，请先停止旧进程") from exc
+        self.handle.seek(0)
+        self.handle.truncate()
+        self.handle.write(str(os.getpid()))
+        self.handle.flush()
+        return self
+
+    def __exit__(self, *_):
+        if self.handle is None:
+            return
+        try:
+            self.handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(self.handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            self.handle.close()
+            self.handle = None
 
 
 # ---------- 本地监控面板（只绑定 127.0.0.1，不对外暴露） ----------
@@ -415,10 +470,21 @@ class JobHeartbeat:
         self.failure = None
         self.thread = None
         self.interval = max(0.05, min(30.0, float(config.get("heartbeat_seconds", 15))))
+        self.state_lock = threading.Lock()
+        self.phase = "starting"
+        self.progress = 0.0
+
+    def update(self, phase: str, progress: float | None = None):
+        with self.state_lock:
+            self.phase = phase[:80]
+            if progress is not None:
+                self.progress = max(0.0, min(1.0, float(progress)))
 
     def pulse(self):
+        with self.state_lock:
+            payload = {"phase": self.phase, "progress": self.progress}
         response = request_json(self.config, "POST",
-            f"/api/inference/jobs/{quote(self.job_id)}/progress", {},
+            f"/api/inference/jobs/{quote(self.job_id)}/progress", payload,
             run_token=self.run_token, timeout=10)
         if response.get("stale"):
             raise AgentLeaseLost("任务租约已失效，保留本地结果，停止回传")
@@ -718,14 +784,18 @@ def run_job(config: dict[str, Any], job: dict[str, Any], run_token: str) -> None
 
     with JobHeartbeat(config, job_id, run_token) as lease:
         # Heartbeat starts before downloading/loading a model, not just after inference.
+        lease.update("downloading", 0.05)
         if not source.is_file() or sha256_file(source) != str(job["input_sha256"]):
             retry_network(config, lambda: download_input(config, job, run_token, source), lease)
         lease.check()
+        lease.update("inference", 0.2)
         options = job.get("options") or {}
         payload = run_inference(config, source, options)
         atomic_write_json(result_path, payload)
         lease.check()
+        lease.update("packaging", 0.85)
         archive_path = build_result_archive(job_root, result_path)
+        lease.update("uploading", 0.95)
         retry_network(config, lambda: upload_result(config, job_id, run_token, archive_path), lease)
 
     # 4. 清理本地任务目录
@@ -786,7 +856,13 @@ def run_loop(config: dict[str, Any], once: bool) -> int:
                 config,
                 "POST",
                 "/api/inference/claim",
-                {"wait_seconds": long_poll, "heartbeat": True},
+                {
+                    "wait_seconds": long_poll,
+                    "heartbeat": True,
+                    "agent_version": AGENT_VERSION,
+                    "protocol_version": PROTOCOL_VERSION,
+                    "capabilities": AGENT_CAPABILITIES,
+                },
                 timeout=max(10.0, long_poll + 5.0),
             )
             if connection_failures:
@@ -902,11 +978,15 @@ def main() -> int:
     args = parser.parse_args()
     try:
         config = load_config(args.config.resolve())
-        if not args.no_monitor:
-            port = int(config.get("monitor_port") or MONITOR_PORT)
-            open_browser = (not args.no_browser) and bool(config.get("monitor_open_browser", True))
-            _start_monitor(port, open_browser=open_browser)
-        return run_loop(config, args.once)
+        safe_node_id = re.sub(r"[^A-Za-z0-9_.-]", "_", config["node_id"])
+        lock_root = Path(os.environ.get("PROGRAMDATA") or config["root"])
+        lock_path = lock_root / "PhysMeta" / "inference-locks" / f"{safe_node_id}.lock"
+        with SingleInstanceLock(lock_path):
+            if not args.no_monitor:
+                port = int(config.get("monitor_port") or MONITOR_PORT)
+                open_browser = (not args.no_browser) and bool(config.get("monitor_open_browser", True))
+                _start_monitor(port, open_browser=open_browser)
+            return run_loop(config, args.once)
     except KeyboardInterrupt:
         return 0
     except AgentAuthenticationError as exc:
