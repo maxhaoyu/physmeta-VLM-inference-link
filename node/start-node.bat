@@ -1,6 +1,19 @@
 @echo off
 setlocal
+chcp 65001 >nul
 cd /d "%~dp0"
+if not exist "%~dp0inference-node.json" (
+  echo.
+  echo [无法启动] 当前目录不是已配置的 PhysMeta 节点目录。
+  echo 缺少文件：%~dp0inference-node.json
+  echo.
+  echo 如果你刚解压了更新包，请返回解压目录运行“升级现有节点.bat”，
+  echo 并指向原节点目录。不要在公开更新包中新建或复制生产 token。
+  echo 新节点必须先由管理员注册并生成本机配置。
+  echo.
+  pause
+  exit /b 1
+)
 if defined PHYS_META_PYTHON (
   "%PHYS_META_PYTHON%" "%~dp0launch_node.py" %*
   goto finished
