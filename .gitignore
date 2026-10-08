@@ -27,3 +27,4 @@ adapters/
 .DS_Store
 *.log
 node/status.json
+dist/
