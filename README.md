@@ -97,7 +97,7 @@ PhysMeta-最小化推理链路/
 ├── node/
 │   ├── agent.py                     ← 精简版节点端（调 bubble_ocr.pipeline.run）
 │   ├── start-node.bat               ← 启动脚本（双击启动 + 崩溃自动重启）
-│   ├── inference-node.example.json  ← 节点配置
+│   ├── inference-node.example.json  ← 无凭据的节点配置示例
 │   ├── vlm_fallback_windows.py      ← Windows 版 VLM 后端（transformers 替换 mlx）
 │   └── requirements-windows.txt     ← Windows 依赖（CUDA 版 torch + transformers）
 ├── server/
