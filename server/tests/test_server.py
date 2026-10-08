@@ -27,6 +27,16 @@ _SERVER_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_SERVER_DIR))
 
 import server as srv  # noqa: E402
+import admin  # noqa: E402
+
+
+def clear_tables():
+    conn = srv.get_db()
+    conn.execute("DELETE FROM job_events")
+    conn.execute("DELETE FROM inference_nodes")
+    conn.execute("DELETE FROM inference_jobs")
+    conn.commit()
+    conn.close()
 
 
 class TokenTest(unittest.TestCase):
@@ -47,10 +57,7 @@ class StateMachineTest(unittest.TestCase):
     def setUp(self):
         srv.init_db()
         # 清空表，保证用例隔离
-        conn = srv.get_db()
-        conn.execute("DELETE FROM inference_jobs")
-        conn.commit()
-        conn.close()
+        clear_tables()
         self.job_id = srv.new_job_id()
 
     def _insert(self, status, run_token=None):
@@ -100,10 +107,7 @@ class StateMachineTest(unittest.TestCase):
 class ClaimReapTest(unittest.TestCase):
     def setUp(self):
         srv.init_db()
-        conn = srv.get_db()
-        conn.execute("DELETE FROM inference_jobs")
-        conn.commit()
-        conn.close()
+        clear_tables()
 
     def _insert(self, status, updated_offset_seconds):
         jid = srv.new_job_id()
@@ -141,6 +145,99 @@ class ClaimReapTest(unittest.TestCase):
         conn.commit()
         conn.close()
         self.assertEqual(srv.job_row(jid)["status"], "pending")
+
+    def test_exhausted_job_moves_to_dead_letter(self):
+        jid = self._insert("processing", srv.PROCESSING_TIMEOUT_SECONDS + 10)
+        conn = srv.get_db()
+        conn.execute(
+            "UPDATE inference_jobs SET attempt_count=3, max_attempts=3 WHERE id=?",
+            (jid,),
+        )
+        srv._reap_stale_claimed(conn)
+        conn.commit()
+        event = conn.execute(
+            "SELECT event_type FROM job_events WHERE job_id=? ORDER BY id DESC LIMIT 1",
+            (jid,),
+        ).fetchone()
+        conn.close()
+        self.assertEqual(srv.job_row(jid)["status"], "dead_letter")
+        self.assertEqual(event["event_type"], "dead_letter")
+
+
+class LeaseMetadataTest(unittest.TestCase):
+    def setUp(self):
+        srv.init_db()
+        clear_tables()
+        self.job_id = srv.new_job_id()
+        conn = srv.get_db()
+        conn.execute(
+            "INSERT INTO inference_jobs (id, input_path, input_sha256, input_bytes) VALUES (?, ?, ?, ?)",
+            (self.job_id, "/tmp/x", "a" * 64, 1),
+        )
+        conn.commit()
+        conn.close()
+
+    def test_claim_records_agent_protocol_attempt_and_event(self):
+        claimed = srv.claim_next_pending(
+            "windows-test",
+            "token",
+            True,
+            agent_version="minimal-1.2.0",
+            protocol_version=2,
+            capabilities=["lease-heartbeat"],
+        )
+        self.assertEqual(claimed["id"], self.job_id)
+        row = srv.job_row(self.job_id)
+        self.assertEqual(row["attempt_count"], 1)
+        self.assertEqual(row["agent_version"], "minimal-1.2.0")
+        self.assertEqual(row["protocol_version"], 2)
+        conn = srv.get_db()
+        node = conn.execute(
+            "SELECT * FROM inference_nodes WHERE node_id='windows-test'"
+        ).fetchone()
+        event = conn.execute(
+            "SELECT event_type FROM job_events WHERE job_id=? ORDER BY id DESC LIMIT 1",
+            (self.job_id,),
+        ).fetchone()
+        conn.close()
+        self.assertEqual(node["current_job"], self.job_id)
+        self.assertEqual(event["event_type"], "claimed")
+
+
+class AdminRescueTest(unittest.TestCase):
+    def setUp(self):
+        srv.init_db()
+        clear_tables()
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.job_id = srv.new_job_id()
+        self.input_path = Path(self.temp.name) / "input.png"
+        self.input_path.write_bytes(b"synthetic")
+        conn = srv.get_db()
+        conn.execute(
+            "INSERT INTO inference_jobs "
+            "(id, input_path, input_sha256, input_bytes, status, node_id, run_token) "
+            "VALUES (?, ?, ?, ?, 'claimed', 'old-node', 'old-token')",
+            (self.job_id, str(self.input_path), "a" * 64, 9),
+        )
+        conn.commit()
+        conn.close()
+
+    def test_backup_then_requeue_rotates_lease(self):
+        backup = Path(self.temp.name) / "backup" / "queue.db"
+        admin.backup_database(backup)
+        self.assertTrue(backup.is_file())
+        result = admin.requeue_job(self.job_id, "legacy node retired")
+        self.assertEqual(result["status"], "pending")
+        row = srv.job_row(self.job_id)
+        self.assertIsNone(row["run_token"])
+        self.assertIsNone(row["node_id"])
+        self.assertEqual(result["events"][-1]["event_type"], "manual_requeue")
+
+    def test_missing_input_refuses_requeue(self):
+        self.input_path.unlink()
+        with self.assertRaisesRegex(ValueError, "input file is missing"):
+            admin.requeue_job(self.job_id, "unsafe")
 
 
 class WaitSecondsTest(unittest.TestCase):
